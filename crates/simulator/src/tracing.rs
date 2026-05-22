@@ -21,7 +21,7 @@ use dag::authority::Authority;
 
 use super::context::SimulatorContext;
 
-const DEFAULT_FILTER: &str = "simulator=warn,dag=warn";
+const DEFAULT_FILTER: &str = "simulator=warn,dag=warn,consensus=info";
 
 #[derive(Default)]
 pub struct SimulatorTracing {

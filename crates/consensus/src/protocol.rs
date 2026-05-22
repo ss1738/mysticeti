@@ -22,10 +22,26 @@ pub enum ConsensusProtocol {
     Mysticeti {
         #[serde(default = "defaults::default_leader_count")]
         leader_count: NonZeroUsize,
+        /// Enable the adaptive leader scheduler, which tunes the
+        /// number of leaders per round based on observed commit rate.
+        #[serde(default)]
+        adaptive_scheduler: bool,
+        #[serde(default = "defaults::default_max_leaders_per_round")]
+        max_leaders_per_round: NonZeroUsize,
+        #[serde(default = "defaults::default_scheduler_interval")]
+        scheduler_interval: RoundNumber,
     },
     BlueBottle {
         #[serde(default = "defaults::default_leader_count")]
         leader_count: NonZeroUsize,
+        /// Enable the adaptive leader scheduler, which tunes the
+        /// number of leaders per round based on observed commit rate.
+        #[serde(default)]
+        adaptive_scheduler: bool,
+        #[serde(default = "defaults::default_max_leaders_per_round")]
+        max_leaders_per_round: NonZeroUsize,
+        #[serde(default = "defaults::default_scheduler_interval")]
+        scheduler_interval: RoundNumber,
     },
     Orcaella {
         #[serde(default = "defaults::default_leader_count")]
@@ -41,10 +57,26 @@ pub enum ConsensusProtocol {
         leader_count: NonZeroUsize,
         #[serde(deserialize_with = "defaults::deserialize_mahi_mahi_wave_length")]
         wave_length: RoundNumber,
+        /// Enable the adaptive leader scheduler, which tunes the
+        /// number of leaders per round based on observed commit rate.
+        #[serde(default)]
+        adaptive_scheduler: bool,
+        #[serde(default = "defaults::default_max_leaders_per_round")]
+        max_leaders_per_round: NonZeroUsize,
+        #[serde(default = "defaults::default_scheduler_interval")]
+        scheduler_interval: RoundNumber,
     },
     NemoNemo {
         #[serde(default = "defaults::default_leader_count")]
         leader_count: NonZeroUsize,
+        /// Enable the adaptive leader scheduler, which tunes the
+        /// number of leaders per round based on observed commit rate.
+        #[serde(default)]
+        adaptive_scheduler: bool,
+        #[serde(default = "defaults::default_max_leaders_per_round")]
+        max_leaders_per_round: NonZeroUsize,
+        #[serde(default = "defaults::default_scheduler_interval")]
+        scheduler_interval: RoundNumber,
     },
     DagHydrangea {
         #[serde(default = "defaults::default_leader_count")]
@@ -68,6 +100,14 @@ mod defaults {
         NonZeroUsize::new(2).unwrap()
     }
 
+    pub fn default_max_leaders_per_round() -> NonZeroUsize {
+        NonZeroUsize::new(5).unwrap()
+    }
+
+    pub fn default_scheduler_interval() -> RoundNumber {
+        50
+    }
+
     pub fn deserialize_mahi_mahi_wave_length<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<RoundNumber, D::Error> {
@@ -85,6 +125,9 @@ impl Default for ConsensusProtocol {
     fn default() -> Self {
         Self::Mysticeti {
             leader_count: defaults::default_leader_count(),
+            adaptive_scheduler: false,
+            max_leaders_per_round: defaults::default_max_leaders_per_round(),
+            scheduler_interval: defaults::default_scheduler_interval(),
         }
     }
 }
@@ -96,12 +139,26 @@ impl fmt::Display for ConsensusProtocol {
                 write!(fmt, "Cordial Miners (PS)")
             }
             Self::CordialMinersAsynchronous => write!(fmt, "Cordial Miners (Async)"),
-            Self::Mysticeti { leader_count } => {
-                write!(fmt, "Mysticeti ({} leaders/round)", leader_count)
-            }
-            Self::BlueBottle { leader_count } => {
-                write!(fmt, "Blue Bottle ({} leaders/round)", leader_count)
-            }
+            Self::Mysticeti {
+                leader_count,
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "Mysticeti ({} leaders/round{})",
+                leader_count,
+                adaptive_label(*adaptive_scheduler)
+            ),
+            Self::BlueBottle {
+                leader_count,
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "Blue Bottle ({} leaders/round{})",
+                leader_count,
+                adaptive_label(*adaptive_scheduler)
+            ),
             Self::Orcaella { leader_count, f, c } => {
                 write!(
                     fmt,
@@ -112,13 +169,26 @@ impl fmt::Display for ConsensusProtocol {
             Self::MahiMahi {
                 leader_count,
                 wave_length,
+                adaptive_scheduler,
+                ..
             } => write!(
                 fmt,
-                "Mahi-Mahi ({} leaders/round, wave length {})",
-                leader_count, wave_length
+                "Mahi-Mahi ({} leaders/round, wave length {}{})",
+                leader_count,
+                wave_length,
+                adaptive_label(*adaptive_scheduler)
             ),
-            Self::NemoNemo { leader_count } => {
-                write!(fmt, "Nemo-Nemo ({} leaders/round)", leader_count)
+            Self::NemoNemo {
+                leader_count,
+                adaptive_scheduler,
+                ..
+            } => {
+                write!(
+                    fmt,
+                    "Nemo-Nemo ({} leaders/round{})",
+                    leader_count,
+                    adaptive_label(*adaptive_scheduler)
+                )
             }
             Self::DagHydrangea {
                 leader_count,
@@ -136,6 +206,16 @@ impl fmt::Display for ConsensusProtocol {
     }
 }
 
+/// Display suffix marking an adaptive-scheduler configuration.
+fn adaptive_label(adaptive_scheduler: bool) -> &'static str {
+    if adaptive_scheduler { ", adaptive" } else { "" }
+}
+
+/// Filename-identifier suffix marking an adaptive-scheduler configuration.
+fn adaptive_suffix(adaptive_scheduler: bool) -> &'static str {
+    if adaptive_scheduler { "-adaptive" } else { "" }
+}
+
 impl fmt::Debug for ConsensusProtocol {
     /// Compact, filesystem-friendly identifier (lowercase name plus the
     /// distinguishing parameters), used in result filenames.
@@ -143,16 +223,46 @@ impl fmt::Debug for ConsensusProtocol {
         match self {
             Self::CordialMinersPartiallySynchronous => write!(fmt, "cordial-miners-ps"),
             Self::CordialMinersAsynchronous => write!(fmt, "cordial-miners-async"),
-            Self::Mysticeti { leader_count } => write!(fmt, "mysticeti-l{leader_count}"),
-            Self::BlueBottle { leader_count } => write!(fmt, "blue-bottle-l{leader_count}"),
+            Self::Mysticeti {
+                leader_count,
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "mysticeti-l{leader_count}{}",
+                adaptive_suffix(*adaptive_scheduler)
+            ),
+            Self::BlueBottle {
+                leader_count,
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "blue-bottle-l{leader_count}{}",
+                adaptive_suffix(*adaptive_scheduler)
+            ),
             Self::Orcaella { leader_count, f, c } => {
                 write!(fmt, "orcaella-l{leader_count}-f{f}-c{c}")
             }
             Self::MahiMahi {
                 leader_count,
                 wave_length,
-            } => write!(fmt, "mahi-mahi-l{leader_count}-w{wave_length}"),
-            Self::NemoNemo { leader_count } => write!(fmt, "nemo-nemo-l{leader_count}"),
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "mahi-mahi-l{leader_count}-w{wave_length}{}",
+                adaptive_suffix(*adaptive_scheduler)
+            ),
+            Self::NemoNemo {
+                leader_count,
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "nemo-nemo-l{leader_count}{}",
+                adaptive_suffix(*adaptive_scheduler)
+            ),
             Self::DagHydrangea {
                 leader_count,
                 f,
@@ -170,11 +280,11 @@ impl ConsensusProtocol {
         let committee_size = committee.len();
         let user_leader_count = match self {
             Self::CordialMinersPartiallySynchronous | Self::CordialMinersAsynchronous => None,
-            Self::Mysticeti { leader_count }
-            | Self::BlueBottle { leader_count }
+            Self::Mysticeti { leader_count, .. }
+            | Self::BlueBottle { leader_count, .. }
             | Self::Orcaella { leader_count, .. }
             | Self::MahiMahi { leader_count, .. }
-            | Self::NemoNemo { leader_count }
+            | Self::NemoNemo { leader_count, .. }
             | Self::DagHydrangea { leader_count, .. } => Some(*leader_count),
         };
         if let Some(leader_count) = user_leader_count
@@ -191,16 +301,50 @@ impl ConsensusProtocol {
                 Protocol::cordial_miners_partially_synchronous(total_stake)
             }
             Self::CordialMinersAsynchronous => Protocol::cordial_miners_asynchronous(total_stake),
-            Self::Mysticeti { leader_count } => Protocol::mysticeti(total_stake, leader_count),
-            Self::BlueBottle { leader_count } => Protocol::blue_bottle(total_stake, leader_count),
+            Self::Mysticeti {
+                leader_count,
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            } => Protocol::mysticeti(total_stake, leader_count).with_scheduler(
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            ),
+            Self::BlueBottle {
+                leader_count,
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            } => Protocol::blue_bottle(total_stake, leader_count).with_scheduler(
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            ),
             Self::Orcaella { leader_count, f, c } => {
                 Protocol::orcaella(total_stake, f, c, leader_count)?
             }
             Self::MahiMahi {
                 leader_count,
                 wave_length,
-            } => Protocol::mahi_mahi(total_stake, leader_count, wave_length)?,
-            Self::NemoNemo { leader_count } => Protocol::nemo_nemo(total_stake, leader_count),
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            } => Protocol::mahi_mahi(total_stake, leader_count, wave_length)?.with_scheduler(
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            ),
+            Self::NemoNemo {
+                leader_count,
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            } => Protocol::nemo_nemo(total_stake, leader_count).with_scheduler(
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            ),
             Self::DagHydrangea {
                 leader_count,
                 f,
@@ -220,9 +364,24 @@ impl ConsensusProtocol {
         let mut variants = Vec::new();
         for &l in leader_counts {
             let leader_count = NonZeroUsize::new(l).expect("leader_count must be non-zero");
-            variants.push(Self::Mysticeti { leader_count });
-            variants.push(Self::BlueBottle { leader_count });
-            variants.push(Self::NemoNemo { leader_count });
+            variants.push(Self::Mysticeti {
+                leader_count,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
+            });
+            variants.push(Self::BlueBottle {
+                leader_count,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
+            });
+            variants.push(Self::NemoNemo {
+                leader_count,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
+            });
             variants.push(Self::Orcaella {
                 leader_count,
                 f: 0,
@@ -245,10 +404,16 @@ impl ConsensusProtocol {
             variants.push(Self::MahiMahi {
                 leader_count,
                 wave_length: 4,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
             });
             variants.push(Self::MahiMahi {
                 leader_count,
                 wave_length: 5,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
             });
             variants.push(Self::DagHydrangea {
                 leader_count,
@@ -372,6 +537,7 @@ pub struct FastPath {
 }
 
 /// Protocol-specific parameters for the consensus committer.
+#[derive(Clone, Copy)]
 pub struct Protocol {
     /// The quorum threshold to directly commit a leader: the number of
     /// certificates required at the decision round (the outer threshold).
@@ -399,6 +565,12 @@ pub struct Protocol {
     pub leader_wait: bool,
     /// Whether to perform real cryptographic operations.
     pub require_crypto: bool,
+    /// Whether the adaptive leader scheduler is enabled.
+    pub adaptive_scheduler: bool,
+    /// Upper bound on leaders per round the scheduler may ramp up to.
+    pub max_leaders_per_round: NonZeroUsize,
+    /// Number of rounds between scheduler reconfigurations.
+    pub scheduler_interval: RoundNumber,
 }
 
 impl Protocol {
@@ -420,6 +592,9 @@ impl Protocol {
             pipeline: false,
             leader_wait: true,
             require_crypto: true,
+            adaptive_scheduler: false,
+            max_leaders_per_round: NonZeroUsize::new(1).unwrap(),
+            scheduler_interval: defaults::default_scheduler_interval(),
         }
     }
 
@@ -441,6 +616,9 @@ impl Protocol {
             pipeline: false,
             leader_wait: false,
             require_crypto: true,
+            adaptive_scheduler: false,
+            max_leaders_per_round: NonZeroUsize::new(1).unwrap(),
+            scheduler_interval: defaults::default_scheduler_interval(),
         }
     }
 
@@ -462,6 +640,9 @@ impl Protocol {
             pipeline: true,
             leader_wait: true,
             require_crypto: true,
+            adaptive_scheduler: false,
+            max_leaders_per_round: leader_count,
+            scheduler_interval: defaults::default_scheduler_interval(),
         }
     }
 
@@ -484,6 +665,9 @@ impl Protocol {
             pipeline: true,
             leader_wait: true,
             require_crypto: true,
+            adaptive_scheduler: false,
+            max_leaders_per_round: leader_count,
+            scheduler_interval: defaults::default_scheduler_interval(),
         }
     }
 
@@ -518,6 +702,9 @@ impl Protocol {
             pipeline: true,
             leader_wait: true,
             require_crypto: f != 0,
+            adaptive_scheduler: false,
+            max_leaders_per_round: leader_count,
+            scheduler_interval: defaults::default_scheduler_interval(),
         })
     }
 
@@ -547,6 +734,9 @@ impl Protocol {
             pipeline: true,
             leader_wait: false,
             require_crypto: true,
+            adaptive_scheduler: false,
+            max_leaders_per_round: leader_count,
+            scheduler_interval: defaults::default_scheduler_interval(),
         })
     }
 
@@ -568,6 +758,9 @@ impl Protocol {
             pipeline: true,
             leader_wait: true,
             require_crypto: false,
+            adaptive_scheduler: false,
+            max_leaders_per_round: leader_count,
+            scheduler_interval: defaults::default_scheduler_interval(),
         }
     }
 
@@ -624,11 +817,28 @@ impl Protocol {
             pipeline: true,
             leader_wait: true,
             require_crypto: f != 0,
+            adaptive_scheduler: false,
+            max_leaders_per_round: leader_count,
+            scheduler_interval: defaults::default_scheduler_interval(),
         })
     }
 }
 
 impl Protocol {
+    /// Apply the user's adaptive-scheduler settings on top of a protocol's
+    /// fixed parameters.
+    pub fn with_scheduler(
+        mut self,
+        adaptive_scheduler: bool,
+        max_leaders_per_round: NonZeroUsize,
+        scheduler_interval: RoundNumber,
+    ) -> Self {
+        self.adaptive_scheduler = adaptive_scheduler;
+        self.max_leaders_per_round = max_leaders_per_round;
+        self.scheduler_interval = scheduler_interval;
+        self
+    }
+
     /// Sensible default round timeout based on whether the protocol
     /// waits for a specific leader (slower, partially synchronous) or
     /// for a quorum of any blocks (faster, asynchronous).

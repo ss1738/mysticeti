@@ -3,7 +3,10 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use crate::{base::BaseCommitter, leader::LeaderElector, protocol::Protocol};
+use crate::{
+    base::BaseCommitter, leader::LeaderElector, leader_scheduler::LeaderScheduler,
+    protocol::Protocol,
+};
 use dag::{
     authority::Authority,
     block::RoundNumber,
@@ -22,8 +25,16 @@ use dag::storage::Storage;
 /// It can be configured to use a combination of different commit strategies, including
 /// multi-leaders, backup leaders, and pipelines.
 pub struct Committer {
+    committee: Arc<Committee>,
     block_reader: BlockReader,
     base_committers: Vec<BaseCommitter>,
+    /// The active protocol; retained so the committer can rebuild its base
+    /// committers when the adaptive scheduler changes the leader count.
+    protocol: Protocol,
+    /// Current number of leaders per round.
+    number_of_leaders: usize,
+    /// The adaptive leader scheduler, present only when enabled by the protocol.
+    scheduler: Option<LeaderScheduler>,
     quorum_threshold: Stake,
     leader_wait: bool,
     /// Whether the protocol has an optimistic fast path; drives the test-only
@@ -32,10 +43,58 @@ pub struct Committer {
     has_fast_path: bool,
     /// Reusable buffer for commit decisions.
     leaders: VecDeque<LeaderStatus>,
+    /// Cumulative leader-decision tally for the `UNDECIDED-CHECK` summary log.
+    tally: DecisionTally,
+}
+
+/// Cumulative leader-decision tally feeding the `UNDECIDED-CHECK` summary
+/// emitted by [`Committer::try_commit`]. Lets a run be inspected for whether
+/// slow leaders actually pass through `Undecided`.
+#[derive(Default)]
+struct DecisionTally {
+    direct_commit: u64,
+    indirect_commit: u64,
+    direct_skip: u64,
+    indirect_skip: u64,
+    /// Most decided leaders ever seen stuck behind an undecided one in a single
+    /// `try_commit` call — the worst commit-pipeline stall observed.
+    max_stuck_behind: usize,
+    /// Highest round at the previous summary log.
+    last_logged_round: RoundNumber,
 }
 
 impl Committer {
     pub fn new(committee: Arc<Committee>, block_reader: BlockReader, protocol: Protocol) -> Self {
+        let number_of_leaders = protocol.leader_count.get();
+        let base_committers =
+            Self::build_base_committers(&committee, &block_reader, &protocol, number_of_leaders);
+        let scheduler = protocol
+            .adaptive_scheduler
+            .then(|| LeaderScheduler::new(&protocol, committee.clone()));
+
+        Self {
+            committee,
+            block_reader,
+            base_committers,
+            protocol,
+            number_of_leaders,
+            scheduler,
+            quorum_threshold: protocol.quorum_threshold,
+            leader_wait: protocol.leader_wait,
+            #[cfg(any(test, feature = "test-utils"))]
+            has_fast_path: protocol.fast_path.is_some(),
+            leaders: VecDeque::new(),
+            tally: DecisionTally::default(),
+        }
+    }
+
+    /// Build one [`BaseCommitter`] per (round offset, leader offset) pair.
+    fn build_base_committers(
+        committee: &Arc<Committee>,
+        block_reader: &BlockReader,
+        protocol: &Protocol,
+        leader_count: usize,
+    ) -> Vec<BaseCommitter> {
         let mut base_committers = Vec::new();
         let pipeline_stages = if protocol.pipeline {
             protocol.wave_length
@@ -44,28 +103,36 @@ impl Committer {
         };
 
         for round_offset in 0..pipeline_stages {
-            for leader_offset in 0..protocol.leader_count.get() {
-                let committer = BaseCommitter::new(
+            for leader_offset in 0..leader_count {
+                base_committers.push(BaseCommitter::new(
                     committee.clone(),
                     block_reader.clone(),
                     LeaderElector::new(committee.len()),
-                    &protocol,
+                    protocol,
                     leader_offset as RoundNumber,
                     round_offset,
-                );
-                base_committers.push(committer);
+                ));
             }
         }
+        base_committers
+    }
 
-        Self {
-            block_reader,
-            base_committers,
-            quorum_threshold: protocol.quorum_threshold,
-            leader_wait: protocol.leader_wait,
-            #[cfg(any(test, feature = "test-utils"))]
-            has_fast_path: protocol.fast_path.is_some(),
-            leaders: VecDeque::new(),
+    /// Rebuild the base committers for a new leader count. No-op if unchanged.
+    fn set_number_of_leaders(&mut self, number_of_leaders: usize) {
+        if self.number_of_leaders == number_of_leaders {
+            return;
         }
+        tracing::debug!(
+            "Updating number of leaders from {} to {number_of_leaders}",
+            self.number_of_leaders,
+        );
+        self.number_of_leaders = number_of_leaders;
+        self.base_committers = Self::build_base_committers(
+            &self.committee,
+            &self.block_reader,
+            &self.protocol,
+            number_of_leaders,
+        );
     }
 
     /// Try to commit part of the dag. This function is idempotent and returns a list of
@@ -107,21 +174,143 @@ impl Committer {
             }
         }
 
-        // The decided sequence is the longest prefix of decided leaders.
-        self.leaders
-            .drain(..)
-            // Position past the previously-yielded decision, if any. When `None`
-            // (fresh start), yield every decided leader from round 0 upward.
-            .skip_while(move |x| match last_decided {
-                Some(round_author) => (x.round(), x.authority()) != round_author,
-                None => false,
+        // Instrumentation: an undecided leader stalls every leader sequenced
+        // behind it (the `take_while` below stops at the first one). Count the
+        // decided leaders stuck behind the first undecided one — a nonzero
+        // figure is a genuine commit-pipeline stall.
+        let stuck_behind = self
+            .leaders
+            .iter()
+            .position(|status| !status.is_decided())
+            .map(|first| {
+                self.leaders
+                    .iter()
+                    .skip(first + 1)
+                    .filter(|status| status.is_decided())
+                    .count()
             })
-            .skip(if last_decided.is_some() { 1 } else { 0 })
+            .unwrap_or(0);
+
+        // Position past the previously-yielded decision. Normally the anchor
+        // `(round, authority)` is matched exactly. But the adaptive scheduler
+        // changes the leader set at a schedule round, and a leader-count
+        // decrease drops the highest-offset leaders — after which the anchor's
+        // authority is no longer elected at its round and the exact match
+        // fails. In that case resume at the first round past the anchor: that
+        // boundary round was already delivered under the old leader count.
+        // Without this fallback the anchor stays unmatched forever, `try_commit`
+        // yields nothing, `last_decided` freezes, and every later call rescans
+        // an ever-growing round range. A fresh start (`None`) skips nothing.
+        let skip = match last_decided {
+            None => 0,
+            Some((round, authority)) => self
+                .leaders
+                .iter()
+                .position(|x| x.round() == round && x.authority() == authority)
+                .map_or_else(
+                    || self.leaders.iter().take_while(|x| x.round() <= round).count(),
+                    |pos| pos + 1,
+                ),
+        };
+
+        // The decided sequence is the longest prefix of decided leaders.
+        let mut sequence: Vec<LeaderStatus> = self
+            .leaders
+            .drain(..)
+            .skip(skip)
             // Filter out all the genesis.
             .filter(|x| x.round() > 0)
             // Stop the sequence upon encountering an undecided leader.
             .take_while(|x| x.is_decided())
             .inspect(|x| tracing::debug!("Decided {x}"))
+            .collect();
+
+        self.run_scheduler(&mut sequence);
+        self.log_decisions(&sequence, stuck_behind, highest_known_round);
+        sequence.into_iter()
+    }
+
+    /// Tally freshly decided leaders and emit a compact `UNDECIDED-CHECK`
+    /// summary roughly every `SUMMARY_ROUNDS` rounds. The `indirect_*` counts
+    /// are the signal of interest: the direct rule only ever leaves a leader
+    /// `Undecided`, and the indirect rule then resolves it — so every indirect
+    /// decision is proof an undecided leader was hit. `max_stall` reports the
+    /// worst pile-up of decided leaders stuck behind an undecided one.
+    fn log_decisions(
+        &mut self,
+        sequence: &[LeaderStatus],
+        stuck_behind: usize,
+        highest_known_round: RoundNumber,
+    ) {
+        const SUMMARY_ROUNDS: RoundNumber = 100;
+
+        for status in sequence {
+            match status {
+                LeaderStatus::DirectCommit(_) => self.tally.direct_commit += 1,
+                LeaderStatus::IndirectCommit(_) => self.tally.indirect_commit += 1,
+                LeaderStatus::DirectSkip(..) => self.tally.direct_skip += 1,
+                LeaderStatus::IndirectSkip(..) => self.tally.indirect_skip += 1,
+                LeaderStatus::Undecided(..) => {}
+            }
+        }
+        self.tally.max_stuck_behind = self.tally.max_stuck_behind.max(stuck_behind);
+
+        if highest_known_round >= self.tally.last_logged_round + SUMMARY_ROUNDS {
+            self.tally.last_logged_round = highest_known_round;
+            let t = &self.tally;
+            tracing::info!(
+                "UNDECIDED-CHECK round={highest_known_round} leaders/round={} | \
+                 direct_commit={} direct_skip={} | indirect_commit={} \
+                 indirect_skip={} (indirect => leader was Undecided) | max_stall={}",
+                self.number_of_leaders,
+                t.direct_commit,
+                t.direct_skip,
+                t.indirect_commit,
+                t.indirect_skip,
+                t.max_stuck_behind,
+            );
+        }
+    }
+
+    /// When the adaptive scheduler is enabled, truncate the decided sequence at
+    /// the first schedule-round commit and reconfigure the leader count.
+    ///
+    /// The truncation is what makes the reconfiguration safe: every replica
+    /// applies the change at the same deterministic point (a committed leader
+    /// on a schedule round), and rounds past that point are re-decided on the
+    /// next call with the new leader count.
+    fn run_scheduler(&mut self, sequence: &mut Vec<LeaderStatus>) {
+        let block_reader = self.block_reader.clone();
+        let optimal = {
+            let Some(scheduler) = self.scheduler.as_mut() else {
+                return;
+            };
+
+            if let Some(pos) = sequence
+                .iter()
+                .position(|x| x.is_commit() && scheduler.is_schedule_round(x.round()))
+            {
+                sequence.truncate(pos + 1);
+            }
+
+            let last_commit = sequence.iter().rev().find_map(|x| match x {
+                LeaderStatus::DirectCommit(block) | LeaderStatus::IndirectCommit(block) => {
+                    Some(block.clone())
+                }
+                _ => None,
+            });
+
+            match last_commit {
+                Some(block) if scheduler.is_schedule_round(block.round()) => {
+                    Some(scheduler.update_leader(&block_reader, block))
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(optimal) = optimal {
+            self.set_number_of_leaders(optimal);
+        }
     }
 }
 
@@ -252,6 +441,9 @@ mod tests {
             pipeline: false,
             leader_wait: true,
             require_crypto: false,
+            adaptive_scheduler: false,
+            max_leaders_per_round: NonZeroUsize::new(1).unwrap(),
+            scheduler_interval: 50,
         }
     }
 

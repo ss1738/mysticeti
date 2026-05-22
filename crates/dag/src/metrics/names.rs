@@ -9,6 +9,7 @@
 // Metric names.
 pub const BENCHMARK_DURATION: &str = "benchmark_duration";
 pub const LATENCY_S: &str = "latency_s";
+pub const TRANSACTION_COMMITTED_LATENCY: &str = "transaction_committed_latency";
 pub const LATENCY_SQUARED_S: &str = "latency_squared_s";
 pub const INTER_BLOCK_LATENCY_S: &str = "inter_block_latency_s";
 pub const COMMITTED_LEADERS_TOTAL: &str = "committed_leaders_total";

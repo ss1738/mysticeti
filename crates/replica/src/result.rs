@@ -124,6 +124,26 @@ pub struct RunResult<C> {
     pub duration: Duration,
     pub kind: RunKind,
     pub storages: Vec<Storage>,
+    /// Per-replica latency time-series, populated only by phased simulator
+    /// runs (empty otherwise). See [`LatencySample`].
+    pub latency_series: Vec<LatencySample>,
+}
+
+/// One per-replica latency observation taken during a phased simulation run.
+/// The field set mirrors the CSV columns consumed by the plotting scripts:
+/// `time_s,validator,p90_ms,avg_ms,phase`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct LatencySample {
+    /// Simulated seconds since the run started.
+    pub time_s: u64,
+    /// Replica index within the committee.
+    pub validator: usize,
+    /// 90th-percentile committed-transaction latency over the window, in ms.
+    pub p90_ms: u64,
+    /// Mean committed-transaction latency over the window, in ms.
+    pub avg_ms: u64,
+    /// 1-based index of the scenario phase this sample belongs to.
+    pub phase: u8,
 }
 
 impl<C> RunResult<C> {
@@ -144,7 +164,14 @@ impl<C> RunResult<C> {
             duration,
             kind,
             storages,
+            latency_series: Vec::new(),
         }
+    }
+
+    /// Attach a per-replica latency time-series (produced by a phased run).
+    pub fn with_latency_series(mut self, latency_series: Vec<LatencySample>) -> Self {
+        self.latency_series = latency_series;
+        self
     }
 }
 

@@ -20,7 +20,7 @@ pub use self::names::{
     BENCHMARK_DURATION, BLOCK_SYNC_REQUESTS_SENT, LABEL_AUTHORITY, LATENCY_S, LATENCY_SQUARED_S,
     LEADER_TIMEOUT_TOTAL, SyncRequestFulfilled,
 };
-pub use self::snapshot::MetricsSnapshot;
+pub use self::snapshot::{MetricsSnapshot, PreciseLatency};
 pub use self::timers::{OwnedUtilizationTimer, UtilizationTimer};
 use self::{
     coarse::CoarseMetrics,

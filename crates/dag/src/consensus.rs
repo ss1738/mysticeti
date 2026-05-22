@@ -77,6 +77,11 @@ impl LeaderStatus {
         !matches!(self, Self::Undecided(..))
     }
 
+    /// True for the two commit variants (`DirectCommit`, `IndirectCommit`).
+    pub fn is_commit(&self) -> bool {
+        matches!(self, Self::DirectCommit(_) | Self::IndirectCommit(_))
+    }
+
     pub fn into_decided_block(self) -> Option<Data<Block>> {
         match self {
             Self::DirectCommit(block) | Self::IndirectCommit(block) => Some(block),

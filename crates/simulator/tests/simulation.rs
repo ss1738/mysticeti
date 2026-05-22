@@ -102,6 +102,9 @@ fn custom_node_parameters() {
             consensus: ConsensusProtocol::MahiMahi {
                 leader_count: NonZeroUsize::new(1).unwrap(),
                 wave_length: 4,
+                adaptive_scheduler: false,
+                max_leaders_per_round: NonZeroUsize::new(5).unwrap(),
+                scheduler_interval: 50,
             },
             ..Default::default()
         },

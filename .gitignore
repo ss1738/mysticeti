@@ -5,6 +5,12 @@ crates/orchestrator/assets/settings.yml
 /target/
 debug/
 
+# Simulation experiment output (CSVs + plots)
+crates/simulator/results/
+
+# Python virtualenv (plotting scripts)
+.venv/
+
 # Backup files from rustfmt
 **/*.rs.bk
 

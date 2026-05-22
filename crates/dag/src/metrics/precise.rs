@@ -46,7 +46,7 @@ impl PreciseMetrics {
 
     fn create(registry: &Registry, committee_size: usize) -> (MetricsReporter, Observers) {
         let (transaction_committed_latency_observer, transaction_committed_latency) =
-            histogram::histogram(registry, "transaction_committed_latency");
+            histogram::histogram(registry, super::names::TRANSACTION_COMMITTED_LATENCY);
         let (proposed_block_size_bytes_observer, proposed_block_size_bytes) =
             histogram::histogram(registry, "proposed_block_size_bytes");
         let (proposed_block_transaction_count_observer, proposed_block_transaction_count) =

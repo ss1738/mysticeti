@@ -8,8 +8,24 @@ use prometheus::{Encoder, TextEncoder, proto::MetricFamily};
 use super::names::{
     COMMIT_TYPE_DIRECT_COMMIT, COMMIT_TYPE_DIRECT_SKIP, COMMIT_TYPE_INDIRECT_COMMIT,
     COMMIT_TYPE_INDIRECT_SKIP, COMMITTED_LEADERS_TOTAL, LABEL_COMMIT_TYPE, LATENCY_S,
-    LEADER_TIMEOUT_TOTAL,
+    LEADER_TIMEOUT_TOTAL, TRANSACTION_COMMITTED_LATENCY,
 };
+
+/// Windowed + cumulative view of the precise committed-transaction latency
+/// histogram. See [`MetricsSnapshot::precise_committed_latency`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreciseLatency {
+    /// Median latency over the current window, in milliseconds.
+    pub p50_ms: f64,
+    /// 90th-percentile latency over the current window, in milliseconds.
+    pub p90_ms: f64,
+    /// 99th-percentile latency over the current window, in milliseconds.
+    pub p99_ms: f64,
+    /// Cumulative sum of all observed latencies since startup, in milliseconds.
+    pub cumulative_sum_ms: f64,
+    /// Cumulative count of all observed latencies since startup.
+    pub cumulative_count: u64,
+}
 
 /// A point-in-time snapshot of all metrics from a Prometheus
 /// registry. Test-only — no production cost.
@@ -114,6 +130,29 @@ impl MetricsSnapshot {
             }
         }
         total as u64
+    }
+
+    /// Windowed committed-transaction latency from the precise histogram.
+    ///
+    /// The precise reporter resets its observation window on every
+    /// `Metrics::collect`, so the percentiles describe only the window since
+    /// the previous collect — suitable for time-series sampling. `sum` and
+    /// `count` are cumulative since startup; take differences across
+    /// consecutive snapshots for a windowed mean.
+    pub fn precise_committed_latency(&self) -> PreciseLatency {
+        // The precise reporter publishes `Duration` gauges in microseconds.
+        let read_ms = |label: &str| {
+            self.scalar_value(TRANSACTION_COMMITTED_LATENCY, &[("v", label)]) / 1000.0
+        };
+        PreciseLatency {
+            p50_ms: read_ms("p50"),
+            p90_ms: read_ms("p90"),
+            p99_ms: read_ms("p99"),
+            cumulative_sum_ms: read_ms("sum"),
+            cumulative_count: self
+                .scalar_value(TRANSACTION_COMMITTED_LATENCY, &[("v", "count")])
+                as u64,
+        }
     }
 
     /// Render the snapshot in the Prometheus text exposition format — the same format every

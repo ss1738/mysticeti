@@ -84,6 +84,9 @@ impl BaseCommitter {
             pipeline: false,
             leader_wait: false,
             require_crypto: false,
+            adaptive_scheduler: false,
+            max_leaders_per_round: std::num::NonZeroUsize::new(1).unwrap(),
+            scheduler_interval: 50,
         };
         BaseCommitter::new(
             committee.clone(),

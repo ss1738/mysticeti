@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """
-Combined plot: time-series latency (top) + per-phase average bar chart (bottom).
+Per-protocol plots, emitted as TWO separate figures:
+
+  * <protocol>_latency.png  — time-series latency line graph
+  * <protocol>_phases.png   — per-phase average bar chart
+
+Both figures share a single y-axis scale that is *normalised across every
+protocol* under the results root, so graphs from different protocols are
+directly comparable. Each figure still covers one protocol (the adaptive
+scheduler vs fixed leader counts of 1 and 5).
 
 Reads the CSVs produced by the `adaptive_scheduling` integration test
-(`crates/simulator/tests/adaptive_scheduling.rs`) and compares the adaptive
-leader scheduler against fixed leader counts of 1 and 5.
+(`crates/simulator/tests/adaptive_scheduling.rs`).
 
 Usage:
-  python3 scripts/plot_adaptive_scheduling_normalized.py --protocol mysticeti
+  # every protocol found under the results root (shared y-axis across all):
+  python3 scripts/plot_adaptive_scheduling_normalized.py
+  # a specific subset:
+  python3 scripts/plot_adaptive_scheduling_normalized.py --protocol mysticeti blue-bottle
 """
 
 import argparse
@@ -17,6 +27,16 @@ from collections import defaultdict
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+VARIANTS = [
+    ("adaptive", "adaptive scheduler"),
+    ("fixed_1",  "fixed leaders (n=1)"),
+    ("fixed_5",  "fixed leaders (n=5)"),
+]
+
+# Headroom above the shared data max so lines / bar labels are not clipped.
+YMAX_HEADROOM = 1.08
 
 
 def load_csv(path):
@@ -117,37 +137,44 @@ def add_phase_shading(ax, t1, t2, t_max, labels=True):
                 ha="center", fontsize=9, color="darkgreen")
 
 
-def plot(series, output):
-    """series: list of (label, timeseries_records, phase_means, t1, t2)"""
-    fig, (ax_ts, ax_bar) = plt.subplots(
-        2, 1, figsize=(11, 9),
-        gridspec_kw={"height_ratios": [2, 1.2]},
-    )
+COLORS  = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+MARKERS = ["o", "s", "^", "D"]
 
-    colors  = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
-    markers = ["o", "s", "^", "D"]
 
-    # Top: time-series
+def plot_timeseries(series, output, ymax):
+    """Time-series latency line graph. series: list of (label, ts_records, means, t1, t2)."""
+    fig, ax = plt.subplots(figsize=(11, 6))
+
     all_times = [r[0] for _, recs, _, _, _ in series for r in recs]
     t_max = max(all_times) if all_times else 1
     t1 = next((t1 for _, _, _, t1, _ in series if t1 is not None), None)
     t2 = next((t2 for _, _, _, _, t2 in series if t2 is not None), None)
 
-    add_phase_shading(ax_ts, t1, t2, t_max, labels=True)
+    add_phase_shading(ax, t1, t2, t_max, labels=True)
 
     for idx, (label, ts_recs, _, _, _) in enumerate(series):
         times = [r[0] for r in ts_recs]
         avgs  = [r[1] for r in ts_recs]
-        ax_ts.plot(times, avgs, label=label, color=colors[idx % len(colors)],
-                   linewidth=1.2, marker=markers[idx % len(markers)], markersize=2.5)
+        ax.plot(times, avgs, label=label, color=COLORS[idx % len(COLORS)],
+                linewidth=1.2, marker=MARKERS[idx % len(MARKERS)], markersize=2.5)
 
-    ax_ts.set_ylabel("Latency (ms)", fontweight="bold")
-    ax_ts.set_xlim(0, t_max)
-    ax_ts.set_ylim(bottom=0)
-    ax_ts.legend(loc="upper left", fontsize=8)
-    ax_ts.grid(True, alpha=0.3)
+    ax.set_ylabel("Latency (ms)", fontweight="bold")
+    ax.set_xlabel("Time (s)", fontweight="bold")
+    ax.set_xlim(0, t_max)
+    ax.set_ylim(0, ymax)
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    # Bottom: per-phase bar chart
+    fig.tight_layout()
+    fig.savefig(output, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to {output}")
+
+
+def plot_phases(series, output, ymax):
+    """Per-phase average latency bar chart. series: list of (label, ts_records, means, t1, t2)."""
+    fig, ax = plt.subplots(figsize=(11, 5))
+
     phase_labels = ["Phase 1\n(healthy)", "Phase 2\n(high latency)", "Phase 3\n(healthy)"]
     n_series = len(series)
     x = np.arange(len(phase_labels))
@@ -156,65 +183,110 @@ def plot(series, output):
 
     for idx, (label, _, means, _, _) in enumerate(series):
         heights = [m if m is not None else 0 for m in means]
-        bars = ax_bar.bar(x + offsets[idx], heights, width, label=label,
-                          color=colors[idx % len(colors)], alpha=0.85)
+        bars = ax.bar(x + offsets[idx], heights, width, label=label,
+                      color=COLORS[idx % len(COLORS)], alpha=0.85)
         for bar, val in zip(bars, means):
             if val is not None:
-                ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                            bar.get_height() * 1.02,
-                            f"{val:.0f}ms", ha="center", va="bottom", fontsize=7)
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() * 1.02,
+                        f"{val:.0f}ms", ha="center", va="bottom", fontsize=7)
 
-    ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels(phase_labels)
-    ax_bar.set_ylabel("Avg latency (ms)", fontweight="bold")
-    ax_bar.set_ylim(bottom=0)
-    ax_bar.legend(fontsize=8)
-    ax_bar.grid(axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(phase_labels)
+    ax.set_ylabel("Avg latency (ms)", fontweight="bold")
+    ax.set_ylim(0, ymax)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(output, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Plot saved to {output}")
+
+
+def load_protocol_series(proto_dir, announce=False):
+    """Return the per-variant series list for one protocol, or [] if no data."""
+    series = []
+    for variant, label in VARIANTS:
+        dirpath = os.path.join(proto_dir, variant)
+        if os.path.isdir(dirpath) and any(f.endswith(".csv") for f in os.listdir(dirpath)):
+            data, t1, t2 = load_csv_dir(dirpath)
+            if announce:
+                n_runs = sum(1 for f in os.listdir(dirpath) if f.endswith(".csv"))
+                print(f"Loaded {n_runs} run(s) for '{label}'")
+            series.append((label, aggregate_timeseries(data), phase_means(data), t1, t2))
+        elif announce:
+            print(f"Warning: no CSVs found in {dirpath}, skipping '{label}'")
+    return series
+
+
+def discover_protocols(results_root):
+    """Protocol folders under results_root that hold at least one variant directory."""
+    if not os.path.isdir(results_root):
+        return []
+    protos = []
+    for name in sorted(os.listdir(results_root)):
+        pdir = os.path.join(results_root, name)
+        if not os.path.isdir(pdir):
+            continue
+        if any(os.path.isdir(os.path.join(pdir, v)) for v, _ in VARIANTS):
+            protos.append(name)
+    return protos
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--protocol", required=True,
-                        help="protocol folder under the results root "
-                             "(e.g. mysticeti, blue-bottle, nemo-nemo, "
-                             "mahi-mahi-4, mahi-mahi-5)")
+    parser.add_argument("--protocol", nargs="+", default=None, metavar="PROTOCOL",
+                        help="one or more protocol folders under the results root "
+                             "(e.g. mysticeti blue-bottle nemo-nemo mahi-mahi-4 "
+                             "mahi-mahi-5). Default: every protocol found.")
     parser.add_argument("--results-root", default="crates/simulator/results",
                         help="base directory holding the per-protocol result folders")
-    parser.add_argument("--output", default=None,
-                        help="output PNG path "
-                             "(default: <results-root>/<protocol>/<protocol>.png)")
+    parser.add_argument("--ymax", type=float, default=None,
+                        help="override the shared y-axis max (ms); default is "
+                             "auto-computed across all selected protocols")
     args = parser.parse_args()
 
-    proto_dir = os.path.join(args.results_root, args.protocol)
-    output = args.output or os.path.join(proto_dir, f"{args.protocol}.png")
+    protocols = args.protocol or discover_protocols(args.results_root)
+    if not protocols:
+        print(f"No protocol folders with data found under '{args.results_root}'. "
+              f"Run the experiments first (scripts/run_protocol.sh <protocol>).")
+        return
+    print(f"Protocols: {', '.join(protocols)}")
 
-    series = []
-    for variant, label in [
-        ("adaptive", "adaptive scheduler"),
-        ("fixed_1",  "fixed leaders (n=1)"),
-        ("fixed_5",  "fixed leaders (n=5)"),
-    ]:
-        dirpath = os.path.join(proto_dir, variant)
-        if os.path.isdir(dirpath) and any(f.endswith(".csv") for f in os.listdir(dirpath)):
-            data, t1, t2 = load_csv_dir(dirpath)
-            n_runs = sum(1 for f in os.listdir(dirpath) if f.endswith(".csv"))
-            print(f"Loaded {n_runs} run(s) for '{label}'")
-            series.append((label, aggregate_timeseries(data), phase_means(data), t1, t2))
+    # Load every selected protocol's series first so the shared, normalised
+    # y-axis can be computed across all of them and applied to each figure.
+    loaded = []
+    for proto in protocols:
+        proto_dir = os.path.join(args.results_root, proto)
+        print(f"\n[{proto}]")
+        series = load_protocol_series(proto_dir, announce=True)
+        if series:
+            loaded.append((proto, proto_dir, series))
         else:
-            print(f"Warning: no CSVs found in {dirpath}, skipping '{label}'")
+            print(f"  No data for '{proto}', skipping. "
+                  f"(run scripts/run_protocol.sh {proto})")
 
-    if not series:
-        print(f"No data found for protocol '{args.protocol}'. Run the experiments "
-              f"first (scripts/run_protocol.sh {args.protocol}).")
+    if not loaded:
+        print("\nNo data found for any selected protocol.")
         return
 
-    os.makedirs(os.path.dirname(output), exist_ok=True)
-    plot(series, output)
+    data_max = args.ymax if args.ymax is not None else max(
+        avg
+        for _, _, series in loaded
+        for _, ts_recs, _, _, _ in series
+        for _, avg in ts_recs
+    )
+    ymax = data_max * YMAX_HEADROOM if data_max and data_max > 0 else None
+    if ymax:
+        print(f"\nShared y-axis max: {ymax:.0f} ms (data max {data_max:.0f} ms)")
+
+    for proto, proto_dir, series in loaded:
+        prefix = os.path.join(proto_dir, proto)
+        os.makedirs(proto_dir, exist_ok=True)
+        plot_timeseries(series, f"{prefix}_latency.png", ymax)
+        plot_phases(series,     f"{prefix}_phases.png",  ymax)
 
 
 if __name__ == "__main__":

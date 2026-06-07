@@ -83,11 +83,8 @@ fn mahi_mahi(leader_count: usize, wave_length: u64, adaptive_scheduler: bool) ->
 const COMMITTEE_SIZE: usize = 10;
 /// The `f` validators whose blocks propagate slowly in the degraded phase.
 const SLOW_VALIDATORS: [usize; 3] = [7, 8, 9];
-/// Validators kept "blind" to slow-validator blocks in the degraded phase. A
-/// slow validator's leader block then reaches only the 5 non-blind validators
-/// — enough votes to avoid a direct skip, too few for a direct commit — so the
-/// leader is left *undecided*.
-const BLIND_VALIDATORS: [usize; 2] = [3, 4];
+/// Validators kept "blind" to slow-validator blocks in the degraded phase.
+const BLIND_VALIDATORS: [usize; 5] = [0, 1, 2, 3, 4];
 
 /// Directory holding the CSVs for one protocol/variant pair:
 /// `results/<protocol>/<variant>/`.
@@ -112,25 +109,15 @@ fn run_index(protocol: &str, variant: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Rotate a validator set by `k` positions within the committee. Rotating the
-/// slow and blind sets together by the same offset is a rigid relabelling: it
-/// preserves the 5-supporter undecided mechanism exactly while shifting which
-/// rounds of the fixed round-robin carry a slow leader. Pooling runs with
-/// distinct `k` therefore decorrelates the round-robin's 10-round cycle.
+/// Rotate a validator set by `k` positions within the committee.
 fn rotate(base: &[usize], k: usize) -> Vec<usize> {
     base.iter().map(|v| (v + k) % COMMITTEE_SIZE).collect()
 }
 
 /// Healthy → degraded → healthy, all full-mesh.
 ///
-/// In the degraded phase each slow validator's links to `BLIND_VALIDATORS` are
-/// slow, so its leader block reaches only a partial quorum (5 of 10): too many
-/// to be directly skipped, too few to be directly committed. The leader is
-/// left **undecided**, which stalls every leader sequenced behind it. A single
-/// leader per round hits one undecided leader ~30% of rounds; with five
-/// leaders per round ~70% of rounds carry an undecided leader, so more leaders
-/// is *worse* under degradation — the regime that makes the adaptive scheduler
-/// pay off.
+/// If BLIND_VALIDATORS IS USED: In the degraded phase each slow validator's links to `BLIND_VALIDATORS` are
+/// slow, so its leader block reaches only a partial quorum (5 of 10)
 fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfig {
     let healthy = |duration_secs| SimulationPhase {
         name: Some("healthy".to_string()),
@@ -140,19 +127,32 @@ fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfi
         sample_interval_secs: 3,
         ..Default::default()
     };
-    let degraded = SimulationPhase {
+    let degraded_blinded = SimulationPhase {
+        name: Some("high-latency".to_string()),
+        latency_min_ms: 50,
+        latency_max_ms: 100,
+        slow_validators: rotate(&SLOW_VALIDATORS, k),
+        slow_latency_min_ms: 1000,
+        slow_latency_max_ms: 1300,
+        slow_blind: rotate(&BLIND_VALIDATORS, k),
+        duration_secs: 400,
+        sample_interval_secs: 5,
+        ..Default::default()
+    };
+
+    let degraded_targeted = SimulationPhase {
         name: Some("high-latency".to_string()),
         latency_min_ms: 50,
         latency_max_ms: 100,
         slow_validators: rotate(&SLOW_VALIDATORS, k),
         slow_latency_min_ms: 5200,
         slow_latency_max_ms: 7500,
-        slow_blind: rotate(&BLIND_VALIDATORS, k),
-        duration_secs: 500,
+        duration_secs: 300,
         sample_interval_secs: 10,
         ..Default::default()
     };
-    let _degraded_uniform = SimulationPhase {
+
+    let degraded_uniform = SimulationPhase {
         name: Some("high-latency".to_string()),
         latency_min_ms: 50,
         latency_max_ms: 1600,
@@ -168,14 +168,12 @@ fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfi
             consensus,
             ..Default::default()
         },
-        phases: vec![healthy(50), degraded, healthy(50)],
+        phases: vec![healthy(100), degraded_blinded, healthy(100)],
         ..Default::default()
     }
 }
 
-/// Next free `results/<protocol>/<variant>/<n>.csv` path, so repeated runs
-/// accumulate rather than overwrite (the plot script pools every CSV in a
-/// directory).
+/// Next free `results/<protocol>/<variant>/<n>.csv` path
 fn next_csv_path(protocol: &str, variant: &str) -> PathBuf {
     let dir = results_dir(protocol, variant);
     fs::create_dir_all(&dir).expect("failed to create CSV directory");
@@ -198,51 +196,11 @@ fn write_csv(path: &Path, samples: &[LatencySample]) {
     }
 }
 
-/// Healthy → uniformly-high-latency → healthy, all full-mesh.
-///
-/// Unlike `three_phase_config`, there are no selective slow validators or
-/// blind validators. Every link degrades to 50–1600 ms in the degraded
-/// phase, stressing the protocol under general slowness rather than the
-/// undecided-leader mechanism.
-fn high_latency_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfig {
-    let healthy = |duration_secs| SimulationPhase {
-        name: Some("healthy".to_string()),
-        latency_min_ms: 50,
-        latency_max_ms: 100,
-        duration_secs,
-        sample_interval_secs: 3,
-        ..Default::default()
-    };
-    let degraded = SimulationPhase {
-        name: Some("high-latency".to_string()),
-        latency_min_ms: 50,
-        latency_max_ms: 1600,
-        duration_secs: 300,
-        sample_interval_secs: 10,
-        ..Default::default()
-    };
-    SimulationConfig {
-        committee_size: COMMITTEE_SIZE,
-        rng_seed: k as u64,
-        replica_parameters: ReplicaParameters {
-            consensus,
-            ..Default::default()
-        },
-        phases: vec![healthy(50), degraded, healthy(50)],
-        ..Default::default()
-    }
-}
-
 /// Run one experiment and append its latency CSV under
 /// `results/<protocol>/<variant>/`.
-fn run_variant_config(
-    protocol: &str,
-    variant: &str,
-    consensus: ConsensusProtocol,
-    config_fn: fn(ConsensusProtocol, usize) -> SimulationConfig,
-) {
+fn run_variant(protocol: &str, variant: &str, consensus: ConsensusProtocol) {
     let k = run_index(protocol, variant);
-    let config = config_fn(consensus, k);
+    let config = three_phase_config(consensus, k);
     let results = SimulationRunner::new(config)
         .run()
         .expect("simulation run failed");
@@ -261,10 +219,6 @@ fn run_variant_config(
         results.latency_series.len(),
         path.display()
     );
-}
-
-fn run_variant(protocol: &str, variant: &str, consensus: ConsensusProtocol) {
-    run_variant_config(protocol, variant, consensus, three_phase_config);
 }
 
 #[test]
@@ -355,24 +309,6 @@ fn mahi_mahi_5_fixed_1() {
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh"]
 fn mahi_mahi_5_fixed_5() {
     run_variant("mahi-mahi-5", "fixed_5", mahi_mahi(5, 5, false));
-}
-
-#[test]
-#[ignore = "long-running experiment; run via scripts/run_protocol.sh"]
-fn mahi_mahi_5_hl_adaptive() {
-    run_variant_config("mahi-mahi-5-hl", "adaptive", mahi_mahi(5, 5, true), high_latency_config);
-}
-
-#[test]
-#[ignore = "long-running experiment; run via scripts/run_protocol.sh"]
-fn mahi_mahi_5_hl_fixed_1() {
-    run_variant_config("mahi-mahi-5-hl", "fixed_1", mahi_mahi(1, 5, false), high_latency_config);
-}
-
-#[test]
-#[ignore = "long-running experiment; run via scripts/run_protocol.sh"]
-fn mahi_mahi_5_hl_fixed_5() {
-    run_variant_config("mahi-mahi-5-hl", "fixed_5", mahi_mahi(5, 5, false), high_latency_config);
 }
 
 #[test]

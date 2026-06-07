@@ -22,8 +22,7 @@ pub enum ConsensusProtocol {
     Mysticeti {
         #[serde(default = "defaults::default_leader_count")]
         leader_count: NonZeroUsize,
-        /// Enable the adaptive leader scheduler, which tunes the
-        /// number of leaders per round based on observed commit rate.
+        /// Enable the adaptive leader scheduler
         #[serde(default)]
         adaptive_scheduler: bool,
         #[serde(default = "defaults::default_max_leaders_per_round")]
@@ -34,8 +33,7 @@ pub enum ConsensusProtocol {
     BlueBottle {
         #[serde(default = "defaults::default_leader_count")]
         leader_count: NonZeroUsize,
-        /// Enable the adaptive leader scheduler, which tunes the
-        /// number of leaders per round based on observed commit rate.
+        /// Enable the adaptive leader scheduler
         #[serde(default)]
         adaptive_scheduler: bool,
         #[serde(default = "defaults::default_max_leaders_per_round")]
@@ -57,8 +55,7 @@ pub enum ConsensusProtocol {
         leader_count: NonZeroUsize,
         #[serde(deserialize_with = "defaults::deserialize_mahi_mahi_wave_length")]
         wave_length: RoundNumber,
-        /// Enable the adaptive leader scheduler, which tunes the
-        /// number of leaders per round based on observed commit rate.
+        /// Enable the adaptive leader scheduler
         #[serde(default)]
         adaptive_scheduler: bool,
         #[serde(default = "defaults::default_max_leaders_per_round")]
@@ -69,8 +66,7 @@ pub enum ConsensusProtocol {
     NemoNemo {
         #[serde(default = "defaults::default_leader_count")]
         leader_count: NonZeroUsize,
-        /// Enable the adaptive leader scheduler, which tunes the
-        /// number of leaders per round based on observed commit rate.
+        /// Enable the adaptive leader scheduler
         #[serde(default)]
         adaptive_scheduler: bool,
         #[serde(default = "defaults::default_max_leaders_per_round")]

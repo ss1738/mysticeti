@@ -50,11 +50,7 @@ pub struct SimulationConfig {
     pub replica_parameters: ReplicaParameters,
     #[serde(default = "defaults::load_generator")]
     pub load_generator: Option<LoadGeneratorConfig>,
-    /// Optional oscillating scenario. When non-empty, the runner walks these
-    /// phases in order — reconfiguring the network and sampling per-replica
-    /// latency between phases — instead of applying a single static topology.
-    /// The top-level `topology`, latency, and `duration_secs` fields are then
-    /// ignored.
+    /// Optional oscillating scenario.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<SimulationPhase>,
 }

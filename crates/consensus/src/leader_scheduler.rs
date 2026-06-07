@@ -77,8 +77,6 @@ impl LeaderScheduler {
         let subdag = self.collect_subdag(block_reader, sequence_leader);
 
         let expected_commits = self.calculate_expected_commits(self.number_of_leaders);
-        // Avoid `count / 0` (NaN/inf): with nothing expected we cannot measure,
-        // so keep the leader count unchanged.
         if expected_commits == 0 {
             self.last_round = anchor_round;
             return self.number_of_leaders;
@@ -92,8 +90,7 @@ impl LeaderScheduler {
             self.consecutive_decreases = 0;
             (self.number_of_leaders + 1).min(self.max_leaders_per_round)
         } else {
-            // Exponential backoff. `2^n` is computed with `checked_shl` so a
-            // long-running degraded network cannot overflow the shift.
+            // Exponential backoff.
             let decrement = 1usize
                 .checked_shl(self.consecutive_decreases)
                 .unwrap_or(usize::MAX);
@@ -241,5 +238,462 @@ impl LeaderScheduler {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use dag::{
+        authority::Authority,
+        block::{Block, RoundNumber},
+        committee::Committee,
+        data::Data,
+        metrics::Metrics,
+        storage::{BlockReader, Storage},
+        test_util::{build_dag, build_dag_layer, committee},
+    };
+
+    use super::LeaderScheduler;
+    use crate::{leader::LeaderElector, protocol::Protocol};
+
+    // --- helpers -----------------------------------------------------------
+
+    /// A Mysticeti protocol (wave 3, pipelined) with the scheduler knobs set.
+    fn mysticeti(committee: &Committee, leaders: usize, max: usize, interval: RoundNumber) -> Protocol {
+        let mut protocol =
+            Protocol::mysticeti(committee.total_stake(), NonZeroUsize::new(leaders).unwrap());
+        protocol.max_leaders_per_round = NonZeroUsize::new(max).unwrap();
+        protocol.scheduler_interval = interval;
+        protocol
+    }
+
+    /// A Blue Bottle protocol (wave 2, pipelined) with the scheduler interval set.
+    fn blue_bottle(committee: &Committee, leaders: usize, interval: RoundNumber) -> Protocol {
+        let mut protocol =
+            Protocol::blue_bottle(committee.total_stake(), NonZeroUsize::new(leaders).unwrap());
+        protocol.scheduler_interval = interval;
+        protocol
+    }
+
+    /// A Cordial Miners protocol (wave 3, *not* pipelined) with the interval set.
+    fn cordial_ps(committee: &Committee, interval: RoundNumber) -> Protocol {
+        let mut protocol =
+            Protocol::cordial_miners_partially_synchronous(committee.total_stake());
+        protocol.scheduler_interval = interval;
+        protocol
+    }
+
+    fn new_storage(committee: &Committee) -> Storage {
+        Storage::new_for_tests(Authority::new(0), Metrics::new_for_test(committee.len()), committee).0
+    }
+
+    /// The committed leader block for `round` under round-robin election.
+    fn leader_block(reader: &BlockReader, elector: &LeaderElector, round: RoundNumber) -> Data<Block> {
+        reader
+            .get_blocks_at_authority_round(elector.elect_leader(round), round)
+            .into_iter()
+            .next()
+            .expect("leader block must exist at the requested round")
+    }
+
+    /// Every block in rounds `lo..=hi`, the slice the decision helpers consume.
+    fn blocks_in_rounds(reader: &BlockReader, lo: RoundNumber, hi: RoundNumber) -> Vec<Data<Block>> {
+        (lo..=hi)
+            .flat_map(|round| reader.get_blocks_by_round(round))
+            .collect()
+    }
+
+    /// Build a DAG up to `stop` in which every block links *only* to authority
+    /// 0's block from the previous round.
+    fn build_degraded_dag(committee: &Committee, storage: &mut Storage, stop: RoundNumber) {
+        // `build_dag(.., None, 0)` seeds and returns the genesis references.
+        let mut refs = build_dag(committee, storage, None, 0);
+        let hub = Authority::new(0);
+        for _ in 1..=stop {
+            let parent = *refs
+                .iter()
+                .find(|reference| reference.authority == hub)
+                .expect("authority 0 produces a block every round");
+            let connections = committee
+                .authorities()
+                .map(|authority| (authority, vec![parent]))
+                .collect();
+            refs = build_dag_layer(connections, storage);
+        }
+    }
+
+    // --- is_schedule_round -------------------------------------------------
+
+    /// A fresh scheduler (`last_round == 0`) reconfigures only once a round
+    /// strictly more than `interval` past round 0 is reached.
+    #[test]
+    fn is_schedule_round_initial_window() {
+        let committee = committee(4);
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        assert!(!scheduler.is_schedule_round(0), "round 0 is never a schedule round");
+        assert!(!scheduler.is_schedule_round(1));
+        assert!(!scheduler.is_schedule_round(10), "exactly `interval` away is not yet due");
+        assert!(scheduler.is_schedule_round(11), "one past `interval` is due");
+        assert!(scheduler.is_schedule_round(100));
+    }
+
+    /// After a reconfiguration the window slides: rounds at or before
+    /// `last_round` never trigger, and the next trigger is `interval + 1` past it.
+    #[test]
+    fn is_schedule_round_slides_with_last_round() {
+        let committee = committee(4);
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+        scheduler.last_round = 50;
+
+        assert!(!scheduler.is_schedule_round(40), "before last_round");
+        assert!(!scheduler.is_schedule_round(50), "exactly at last_round");
+        assert!(!scheduler.is_schedule_round(60), "exactly `interval` past last_round");
+        assert!(scheduler.is_schedule_round(61), "one past the window");
+    }
+
+    // --- calculate_expected_commits ---------------------------------------
+
+    /// Pipelined wave-3: every round has leaders, and the two trailing rounds
+    /// of the window cannot have decided yet -> `(interval - 2) * leaders`.
+    #[test]
+    fn expected_commits_pipelined() {
+        let committee = committee(4);
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 50), committee.clone());
+        assert_eq!(scheduler.calculate_expected_commits(1), 48);
+        assert_eq!(scheduler.calculate_expected_commits(3), 144);
+
+        // Windows too short to decide anything yield zero.
+        let tiny = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 2), committee.clone());
+        assert_eq!(tiny.calculate_expected_commits(5), 0);
+        let tinier = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 1), committee.clone());
+        assert_eq!(tinier.calculate_expected_commits(5), 0);
+    }
+
+    /// Non-pipelined wave-3: only one round per wave carries leaders, so the
+    /// count is divided by the wave length.
+    #[test]
+    fn expected_commits_non_pipelined() {
+        let committee = committee(4);
+        let scheduler = LeaderScheduler::new(&cordial_ps(&committee, 50), committee.clone());
+        // round_count = 50 - 2 = 48; divided by wave length 3.
+        assert_eq!(scheduler.calculate_expected_commits(1), 16);
+        assert_eq!(scheduler.calculate_expected_commits(3), 48);
+    }
+
+    /// Wave-2 (pipelined): only the single trailing round cannot have decided
+    /// yet -> `(interval - 1) * leaders`.
+    #[test]
+    fn expected_commits_wave_two() {
+        let committee = committee(4);
+        let scheduler = LeaderScheduler::new(&blue_bottle(&committee, 1, 50), committee.clone());
+        assert_eq!(scheduler.calculate_expected_commits(1), 49);
+        assert_eq!(scheduler.calculate_expected_commits(2), 98);
+    }
+
+    // --- collect_subdag ----------------------------------------------------
+
+    /// The sub-dag spans exactly `[anchor - interval, anchor]`; only the anchor
+    /// occupies the top round (the walk descends through `includes`).
+    #[test]
+    fn collect_subdag_spans_one_interval() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        let subdag = scheduler.collect_subdag(&reader, anchor);
+
+        let mut rounds: Vec<RoundNumber> = subdag.iter().map(|block| block.round()).collect();
+        rounds.sort_unstable();
+        rounds.dedup();
+        assert_eq!(rounds, (2..=12).collect::<Vec<_>>());
+        assert_eq!(
+            subdag.iter().filter(|block| block.round() == 12).count(),
+            1,
+            "only the anchor sits on the top round",
+        );
+        assert_eq!(subdag.iter().filter(|block| block.round() == 11).count(), 4);
+    }
+
+    /// `saturating_sub` keeps the walk from underflowing when the anchor round
+    /// is below the interval: the window simply bottoms out at genesis.
+    #[test]
+    fn collect_subdag_saturates_at_genesis() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 5);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 5);
+        let subdag = scheduler.collect_subdag(&reader, anchor);
+
+        let min = subdag.iter().map(|block| block.round()).min().unwrap();
+        assert_eq!(min, 0, "until = 5.saturating_sub(10) = 0, so genesis is included");
+    }
+
+    // --- is_directly_committed --------------------------------------------
+
+    /// Wave 3, full mesh: the leader is supported and certified by a quorum.
+    #[test]
+    fn directly_committed_wave3_full_mesh() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 5);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let leader = leader_block(&reader, &elector, 3);
+        let blocks = blocks_in_rounds(&reader, 3, 5);
+        assert!(scheduler.is_directly_committed(&leader, &blocks));
+    }
+
+    /// Wave 3: without the decision round (`leader + 2`) in the slice there can
+    /// be no certificate, so the leader is undecided here.
+    #[test]
+    fn not_directly_committed_wave3_without_decision_round() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 5);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let leader = leader_block(&reader, &elector, 3);
+        let blocks = blocks_in_rounds(&reader, 3, 4); // decision round 5 omitted
+        assert!(!scheduler.is_directly_committed(&leader, &blocks));
+    }
+
+    /// Wave 3, degraded: no block at `leader + 1` votes for the leader, so
+    /// support never propagates.
+    #[test]
+    fn not_directly_committed_wave3_unsupported() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_degraded_dag(&committee, &mut storage, 5);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        // elect_leader(3) is authority 3, which no block links to in the star DAG.
+        let leader = leader_block(&reader, &elector, 3);
+        let blocks = blocks_in_rounds(&reader, 3, 5);
+        assert!(!scheduler.is_directly_committed(&leader, &blocks));
+    }
+
+    /// Wave 2, full mesh: votes and certificates coincide on the decision round
+    /// (the special-cased branch) and a quorum includes the leader.
+    #[test]
+    fn directly_committed_wave2_full_mesh() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 4);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&blue_bottle(&committee, 1, 10), committee.clone());
+
+        let leader = leader_block(&reader, &elector, 3);
+        let blocks = blocks_in_rounds(&reader, 3, 4);
+        assert!(scheduler.is_directly_committed(&leader, &blocks));
+    }
+
+    /// Wave 2, degraded: no decision-round block includes the (non-hub) leader.
+    #[test]
+    fn not_directly_committed_wave2_unsupported() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_degraded_dag(&committee, &mut storage, 4);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&blue_bottle(&committee, 1, 10), committee.clone());
+
+        let leader = leader_block(&reader, &elector, 3);
+        let blocks = blocks_in_rounds(&reader, 3, 4);
+        assert!(!scheduler.is_directly_committed(&leader, &blocks));
+    }
+
+    // --- count_direct_commits ---------------------------------------------
+
+    /// A healthy full mesh commits every leader in the window, so the measured
+    /// count equals the analytical expectation (commit rate 1.0).
+    #[test]
+    fn count_direct_commits_full_mesh_single_leader() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        let subdag = scheduler.collect_subdag(&reader, anchor);
+        let expected = scheduler.calculate_expected_commits(1);
+        assert_eq!(expected, 8);
+        assert_eq!(scheduler.count_direct_commits(&subdag, &reader, 1) as u64, expected);
+    }
+
+    /// Same, with five leaders per round on a committee of 10 (offsets 0..5
+    /// stay distinct so each is a separate leader).
+    #[test]
+    fn count_direct_commits_full_mesh_multi_leader() {
+        let committee = committee(10);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        let subdag = scheduler.collect_subdag(&reader, anchor);
+        let expected = scheduler.calculate_expected_commits(5);
+        assert_eq!(expected, 40);
+        assert_eq!(scheduler.count_direct_commits(&subdag, &reader, 5) as u64, expected);
+    }
+
+    /// A degraded DAG commits nothing, for any leader count.
+    #[test]
+    fn count_direct_commits_degraded_is_zero() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_degraded_dag(&committee, &mut storage, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        let subdag = scheduler.collect_subdag(&reader, anchor);
+        assert_eq!(scheduler.count_direct_commits(&subdag, &reader, 1), 0);
+        assert_eq!(scheduler.count_direct_commits(&subdag, &reader, 4), 0);
+    }
+
+    // --- update_leader (end-to-end control loop) --------------------------
+
+    /// Healthy network -> additive increase, backoff counter stays reset, and
+    /// the reconfiguration round is recorded.
+    #[test]
+    fn update_leader_increases_when_healthy() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        assert_eq!(scheduler.update_leader(&reader, anchor), 2);
+        assert_eq!(scheduler.number_of_leaders, 2);
+        assert_eq!(scheduler.consecutive_decreases, 0);
+        assert_eq!(scheduler.last_round, 12);
+    }
+
+    /// Additive increase never exceeds `max_leaders_per_round`.
+    #[test]
+    fn update_leader_caps_at_max() {
+        let committee = committee(10);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        assert_eq!(scheduler.update_leader(&reader, anchor), 5, "capped at max");
+        assert_eq!(scheduler.number_of_leaders, 5);
+    }
+
+    /// Unhealthy network -> one multiplicative-backoff step (decrement 1) and
+    /// the consecutive-decrease counter advances.
+    #[test]
+    fn update_leader_decreases_when_degraded() {
+        let committee = committee(10);
+        let mut storage = new_storage(&committee);
+        build_degraded_dag(&committee, &mut storage, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 4, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        assert_eq!(scheduler.update_leader(&reader, anchor), 3);
+        assert_eq!(scheduler.consecutive_decreases, 1);
+        assert_eq!(scheduler.last_round, 12);
+    }
+
+    /// Sustained degradation backs off exponentially: 5 -> 4 -> 2 -> 1, with
+    /// the decrement doubling (1, 2, 4, 8) each consecutive step.
+    #[test]
+    fn update_leader_backs_off_exponentially() {
+        let committee = committee(10);
+        let mut storage = new_storage(&committee);
+        build_degraded_dag(&committee, &mut storage, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        assert_eq!(scheduler.update_leader(&reader, anchor.clone()), 4); // -1
+        assert_eq!(scheduler.update_leader(&reader, anchor.clone()), 2); // -2
+        assert_eq!(scheduler.update_leader(&reader, anchor.clone()), 1); // -4, floored
+        assert_eq!(scheduler.update_leader(&reader, anchor), 1); // -8, floored
+        assert_eq!(scheduler.consecutive_decreases, 4);
+    }
+
+    /// Backoff never drops below a single leader.
+    #[test]
+    fn update_leader_floors_at_one() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_degraded_dag(&committee, &mut storage, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+
+        let anchor = leader_block(&reader, &elector, 12);
+        assert_eq!(scheduler.update_leader(&reader, anchor.clone()), 1);
+        assert_eq!(scheduler.update_leader(&reader, anchor), 1);
+    }
+
+    /// Recovery after backoff: the consecutive-decrease counter resets, so the
+    /// next healthy window goes back to additive (single-step) increase.
+    #[test]
+    fn update_leader_resets_backoff_on_recovery() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 12);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 2, 5, 10), committee.clone());
+        scheduler.consecutive_decreases = 3; // pretend we had been backing off
+
+        let anchor = leader_block(&reader, &elector, 12);
+        assert_eq!(scheduler.update_leader(&reader, anchor), 3, "additive, not jumped");
+        assert_eq!(scheduler.consecutive_decreases, 0);
+    }
+
+    /// When the window is too short to expect any commit, the leader count is
+    /// left untouched (and the backoff counter is not disturbed), but the
+    /// reconfiguration round still advances.
+    #[test]
+    fn update_leader_no_change_when_expected_zero() {
+        let committee = committee(4);
+        let mut storage = new_storage(&committee);
+        build_dag(&committee, &mut storage, None, 5);
+        let reader = storage.block_reader().clone();
+        let elector = LeaderElector::new(committee.len());
+        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 3, 5, 2), committee.clone());
+        scheduler.consecutive_decreases = 2;
+
+        let anchor = leader_block(&reader, &elector, 4);
+        assert_eq!(scheduler.update_leader(&reader, anchor), 3, "unchanged");
+        assert_eq!(scheduler.number_of_leaders, 3);
+        assert_eq!(scheduler.consecutive_decreases, 2, "left alone");
+        assert_eq!(scheduler.last_round, 4);
     }
 }

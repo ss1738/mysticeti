@@ -35,6 +35,16 @@ VARIANTS = [
     ("fixed_5",  "fixed leaders (n=5)"),
 ]
 
+# Human-readable scenario name (for figure titles) and the label drawn over the
+# stressed middle phase, keyed by the results-root subfolder.
+SCENARIO_DISPLAY   = {"crash": "crash faults", "degraded": "slow network"}
+SCENARIO_MID_LABEL = {"crash": "crash",        "degraded": "slow network"}
+
+
+def pretty_protocol(name):
+    """'blue-bottle' -> 'Blue Bottle', 'mahi-mahi-4' -> 'Mahi Mahi 4'."""
+    return name.replace("-", " ").title()
+
 # Headroom above the shared data max so lines / bar labels are not clipped.
 YMAX_HEADROOM = 1.08
 
@@ -116,7 +126,7 @@ def phase_means(data):
     )
 
 
-def add_phase_shading(ax, t1, t2, t_max, labels=True):
+def add_phase_shading(ax, t1, t2, t_max, labels=True, mid_label="high latency"):
     if t1 is None or t2 is None:
         return
     ax.axvspan(0,  t1,    alpha=0.06, color="green")
@@ -131,7 +141,7 @@ def add_phase_shading(ax, t1, t2, t_max, labels=True):
                     ha="center", fontsize=10, color="dimgrey")
         ax.text((0 + t1) / 2,    1.07, "healthy",      transform=xform,
                 ha="center", fontsize=9, color="darkgreen")
-        ax.text((t1 + t2) / 2,   1.07, "high latency", transform=xform,
+        ax.text((t1 + t2) / 2,   1.07, mid_label, transform=xform,
                 ha="center", fontsize=9, color="firebrick")
         ax.text((t2 + t_max) / 2, 1.07, "healthy",     transform=xform,
                 ha="center", fontsize=9, color="darkgreen")
@@ -141,16 +151,18 @@ COLORS  = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
 MARKERS = ["o", "s", "^", "D"]
 
 
-def plot_timeseries(series, output, ymax):
+def plot_timeseries(series, output, ymax, title=None, mid_label="high latency"):
     """Time-series latency line graph. series: list of (label, ts_records, means, t1, t2)."""
     fig, ax = plt.subplots(figsize=(11, 6))
+    if title:
+        ax.set_title(title, fontweight="bold", fontsize=13, pad=40)
 
     all_times = [r[0] for _, recs, _, _, _ in series for r in recs]
     t_max = max(all_times) if all_times else 1
     t1 = next((t1 for _, _, _, t1, _ in series if t1 is not None), None)
     t2 = next((t2 for _, _, _, _, t2 in series if t2 is not None), None)
 
-    add_phase_shading(ax, t1, t2, t_max, labels=True)
+    add_phase_shading(ax, t1, t2, t_max, labels=True, mid_label=mid_label)
 
     for idx, (label, ts_recs, _, _, _) in enumerate(series):
         times = [r[0] for r in ts_recs]
@@ -171,11 +183,13 @@ def plot_timeseries(series, output, ymax):
     print(f"Plot saved to {output}")
 
 
-def plot_phases(series, output, ymax):
+def plot_phases(series, output, ymax, title=None, mid_label="high latency"):
     """Per-phase average latency bar chart. series: list of (label, ts_records, means, t1, t2)."""
     fig, ax = plt.subplots(figsize=(11, 5))
+    if title:
+        ax.set_title(title, fontweight="bold")
 
-    phase_labels = ["Phase 1\n(healthy)", "Phase 2\n(high latency)", "Phase 3\n(healthy)"]
+    phase_labels = ["Phase 1\n(healthy)", f"Phase 2\n({mid_label})", "Phase 3\n(healthy)"]
     n_series = len(series)
     x = np.arange(len(phase_labels))
     width = 0.22
@@ -246,7 +260,15 @@ def main():
     parser.add_argument("--ymax", type=float, default=None,
                         help="override the shared y-axis max (ms); default is "
                              "auto-computed across all selected protocols")
+    parser.add_argument("--scenario", default=None,
+                        help="scenario name used in titles and the middle-phase "
+                             "label; default inferred from the results-root "
+                             "basename ('crash' or 'degraded')")
     args = parser.parse_args()
+
+    scenario = args.scenario or os.path.basename(os.path.normpath(args.results_root))
+    scenario_display = SCENARIO_DISPLAY.get(scenario, scenario)
+    mid_label = SCENARIO_MID_LABEL.get(scenario, "high latency")
 
     protocols = args.protocol or discover_protocols(args.results_root)
     if not protocols:
@@ -285,8 +307,9 @@ def main():
     for proto, proto_dir, series in loaded:
         prefix = os.path.join(proto_dir, proto)
         os.makedirs(proto_dir, exist_ok=True)
-        plot_timeseries(series, f"{prefix}_latency.png", ymax)
-        plot_phases(series,     f"{prefix}_phases.png",  ymax)
+        title = f"{pretty_protocol(proto)} — {scenario_display}"
+        plot_timeseries(series, f"{prefix}_latency.png", ymax, title, mid_label)
+        plot_phases(series,     f"{prefix}_phases.png",  ymax, title, mid_label)
 
 
 if __name__ == "__main__":

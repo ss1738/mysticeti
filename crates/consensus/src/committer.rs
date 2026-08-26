@@ -43,24 +43,6 @@ pub struct Committer {
     has_fast_path: bool,
     /// Reusable buffer for commit decisions.
     leaders: VecDeque<LeaderStatus>,
-    /// Cumulative leader-decision tally for the `UNDECIDED-CHECK` summary log.
-    tally: DecisionTally,
-}
-
-/// Cumulative leader-decision tally feeding the `UNDECIDED-CHECK` summary
-/// emitted by [`Committer::try_commit`]. Lets a run be inspected for whether
-/// slow leaders actually pass through `Undecided`.
-#[derive(Default)]
-struct DecisionTally {
-    direct_commit: u64,
-    indirect_commit: u64,
-    direct_skip: u64,
-    indirect_skip: u64,
-    /// Most decided leaders ever seen stuck behind an undecided one in a single
-    /// `try_commit` call — the worst commit-pipeline stall observed.
-    max_stuck_behind: usize,
-    /// Highest round at the previous summary log.
-    last_logged_round: RoundNumber,
 }
 
 impl Committer {
@@ -84,7 +66,6 @@ impl Committer {
             #[cfg(any(test, feature = "test-utils"))]
             has_fast_path: protocol.fast_path.is_some(),
             leaders: VecDeque::new(),
-            tally: DecisionTally::default(),
         }
     }
 
@@ -174,23 +155,6 @@ impl Committer {
             }
         }
 
-        // Instrumentation: an undecided leader stalls every leader sequenced
-        // behind it (the `take_while` below stops at the first one). Count the
-        // decided leaders stuck behind the first undecided one — a nonzero
-        // figure is a genuine commit-pipeline stall.
-        let stuck_behind = self
-            .leaders
-            .iter()
-            .position(|status| !status.is_decided())
-            .map(|first| {
-                self.leaders
-                    .iter()
-                    .skip(first + 1)
-                    .filter(|status| status.is_decided())
-                    .count()
-            })
-            .unwrap_or(0);
-
         // Position past the previously-yielded decision. Normally the anchor
         // `(round, authority)` is matched exactly. But the adaptive scheduler
         // changes the leader set at a schedule round, and a leader-count
@@ -231,50 +195,7 @@ impl Committer {
             .collect();
 
         self.run_scheduler(&mut sequence);
-        self.log_decisions(&sequence, stuck_behind, highest_known_round);
         sequence.into_iter()
-    }
-
-    /// Tally freshly decided leaders and emit a compact `UNDECIDED-CHECK`
-    /// summary roughly every `SUMMARY_ROUNDS` rounds. The `indirect_*` counts
-    /// are the signal of interest: the direct rule only ever leaves a leader
-    /// `Undecided`, and the indirect rule then resolves it — so every indirect
-    /// decision is proof an undecided leader was hit. `max_stall` reports the
-    /// worst pile-up of decided leaders stuck behind an undecided one.
-    fn log_decisions(
-        &mut self,
-        sequence: &[LeaderStatus],
-        stuck_behind: usize,
-        highest_known_round: RoundNumber,
-    ) {
-        const SUMMARY_ROUNDS: RoundNumber = 100;
-
-        for status in sequence {
-            match status {
-                LeaderStatus::DirectCommit(_) => self.tally.direct_commit += 1,
-                LeaderStatus::IndirectCommit(_) => self.tally.indirect_commit += 1,
-                LeaderStatus::DirectSkip(..) => self.tally.direct_skip += 1,
-                LeaderStatus::IndirectSkip(..) => self.tally.indirect_skip += 1,
-                LeaderStatus::Undecided(..) => {}
-            }
-        }
-        self.tally.max_stuck_behind = self.tally.max_stuck_behind.max(stuck_behind);
-
-        if highest_known_round >= self.tally.last_logged_round + SUMMARY_ROUNDS {
-            self.tally.last_logged_round = highest_known_round;
-            let t = &self.tally;
-            tracing::info!(
-                "UNDECIDED-CHECK round={highest_known_round} leaders/round={} | \
-                 direct_commit={} direct_skip={} | indirect_commit={} \
-                 indirect_skip={} (indirect => leader was Undecided) | max_stall={}",
-                self.number_of_leaders,
-                t.direct_commit,
-                t.direct_skip,
-                t.indirect_commit,
-                t.indirect_skip,
-                t.max_stuck_behind,
-            );
-        }
     }
 
     /// When the adaptive scheduler is enabled, truncate the decided sequence at

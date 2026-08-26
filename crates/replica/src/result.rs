@@ -131,7 +131,7 @@ pub struct RunResult<C> {
 
 /// One per-replica latency observation taken during a phased simulation run.
 /// The field set mirrors the CSV columns consumed by the plotting scripts:
-/// `time_s,validator,p90_ms,avg_ms,phase,commits,leaders`.
+/// `time_s,validator,p90_ms,avg_ms,phase,commits,leaders,timeouts,direct_commits,direct_skips,indirect`.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct LatencySample {
     /// Simulated seconds since the run started.
@@ -151,6 +151,18 @@ pub struct LatencySample {
     /// Leaders per round the replica's committer was electing at sample time;
     /// the adaptive scheduler's trace.
     pub leaders: u64,
+    /// Leader timeouts the replica fired in the window: rounds in which it gave
+    /// up waiting for a leader block and proposed without it.
+    pub timeouts: u64,
+    /// Leader slots the replica committed by the direct rule in the window.
+    pub direct_commits: u64,
+    /// Leader slots the replica skipped by the direct rule (a quorum of
+    /// blames) in the window.
+    pub direct_skips: u64,
+    /// Leader slots decided by the indirect rule in the window — each one a
+    /// slot the direct rule left undecided and that stalled the sequence
+    /// behind it until an anchor resolved it.
+    pub indirect: u64,
 }
 
 impl<C> RunResult<C> {

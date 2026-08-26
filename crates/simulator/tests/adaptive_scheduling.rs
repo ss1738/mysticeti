@@ -30,11 +30,15 @@
 //!   The more leaders per round, the more rounds wait out the timeout for a
 //!   dead leader, so the adaptive scheduler should back off here too.
 //!
-//! Each run writes a `time_s,validator,p90_ms,avg_ms,phase,commits,leaders`
-//! CSV under `results/<set>/<protocol>/<variant>/` (`<set>` is `degraded` or
-//! `crash`); `leaders` is the committer's leaders-per-round at sample time,
-//! i.e. the adaptive scheduler's trace, and `commits` is how many of the
-//! replica's own transactions committed in the window (`0` = stalled).
+//! Each run writes a CSV under `results/<set>/<protocol>/<variant>/` (`<set>`
+//! is `degraded` or `crash`) with one row per replica per sample window:
+//! `time_s,validator,p90_ms,avg_ms,phase,commits,leaders,timeouts,direct_commits,direct_skips,indirect`.
+//! `leaders` is the committer's leaders-per-round at sample time (the adaptive
+//! scheduler's trace); `commits` is how many of the replica's own transactions
+//! committed in the window (`0` = stalled); the last four are the window's
+//! leader timeouts and leader-slot decisions by type, read from the replica's
+//! metrics — `timeouts` is the cost of waiting on slow or dead leaders, and
+//! `indirect` counts slots the direct rule left undecided.
 //! `scripts/plot_adaptive_scheduling_normalized.py` pools those CSVs into the
 //! per-protocol comparison plots (latency over time, per-phase means, and the
 //! leaders-per-round trace with the scheduler's lag), which show how
@@ -289,12 +293,26 @@ fn next_csv_path(scenario: &str, protocol: &str, variant: &str) -> PathBuf {
 
 fn write_csv(path: &Path, samples: &[LatencySample]) {
     let mut file = fs::File::create(path).expect("failed to create latency CSV");
-    writeln!(file, "time_s,validator,p90_ms,avg_ms,phase,commits,leaders").unwrap();
+    writeln!(
+        file,
+        "time_s,validator,p90_ms,avg_ms,phase,commits,leaders,timeouts,direct_commits,direct_skips,indirect"
+    )
+    .unwrap();
     for s in samples {
         writeln!(
             file,
-            "{},{},{},{},{},{},{}",
-            s.time_s, s.validator, s.p90_ms, s.avg_ms, s.phase, s.commits, s.leaders
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            s.time_s,
+            s.validator,
+            s.p90_ms,
+            s.avg_ms,
+            s.phase,
+            s.commits,
+            s.leaders,
+            s.timeouts,
+            s.direct_commits,
+            s.direct_skips,
+            s.indirect
         )
         .unwrap();
     }

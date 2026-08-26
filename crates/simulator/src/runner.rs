@@ -108,9 +108,7 @@ impl SimulatedNetwork {
         let latency_range = Duration::from_millis(50)..Duration::from_millis(100);
         let (mut network, replicas, _, _) =
             SimulationState::build_replicas(public_config, None, commit_consumers).await;
-        network
-            .connect_all(move |_, _| latency_range.clone())
-            .await;
+        network.connect_all(move |_, _| latency_range.clone()).await;
         (network, replicas)
     }
 }
@@ -179,9 +177,12 @@ impl SimulationState {
         let public_config = PublicReplicaConfig::new_for_tests(config.committee_size)
             .with_parameters(config.replica_parameters.clone());
         let commit_consumers = vec![None; config.committee_size];
-        let (network, replicas, metrics, load_generators) =
-            Self::build_replicas(public_config, config.load_generator.clone(), commit_consumers)
-                .await;
+        let (network, replicas, metrics, load_generators) = Self::build_replicas(
+            public_config,
+            config.load_generator.clone(),
+            commit_consumers,
+        )
+        .await;
 
         Self {
             config,
@@ -215,6 +216,9 @@ impl SimulationState {
         // Per-replica (cumulative_sum_ms, cumulative_count) at the previous
         // sample, used to derive a windowed mean by differencing.
         let mut previous = vec![(0.0_f64, 0_u64); self.metrics.len()];
+        // Per-replica cumulative decision counters at the previous sample:
+        // (leader timeouts, direct commits, direct skips, indirect decisions).
+        let mut previous_counters = vec![[0_u64; 4]; self.metrics.len()];
         let mut elapsed_total = 0u64;
 
         for (index, phase) in phases.iter().enumerate() {
@@ -245,6 +249,18 @@ impl SimulationState {
                         0.0
                     };
                     previous[validator] = (latency.cumulative_sum_ms, latency.cumulative_count);
+                    let counters = [
+                        snapshot.leader_timeouts(),
+                        snapshot.direct_commits(),
+                        snapshot.direct_skips(),
+                        snapshot.indirect_decisions(),
+                    ];
+                    let window: Vec<u64> = counters
+                        .iter()
+                        .zip(previous_counters[validator])
+                        .map(|(now, before)| now.saturating_sub(before))
+                        .collect();
+                    previous_counters[validator] = counters;
                     samples.push(LatencySample {
                         time_s: elapsed_total,
                         validator,
@@ -253,6 +269,10 @@ impl SimulationState {
                         phase: phase_number,
                         commits: delta_count,
                         leaders,
+                        timeouts: window[0],
+                        direct_commits: window[1],
+                        direct_skips: window[2],
+                        indirect: window[3],
                     });
                 }
             }

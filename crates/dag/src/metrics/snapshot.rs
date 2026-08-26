@@ -120,6 +120,18 @@ impl MetricsSnapshot {
         self.commit_type_total(COMMIT_TYPE_INDIRECT_SKIP)
     }
 
+    /// Leaders committed by the indirect rule (via an anchor).
+    pub fn indirect_commits(&self) -> u64 {
+        self.commit_type_total(COMMIT_TYPE_INDIRECT_COMMIT)
+    }
+
+    /// Leaders decided by the indirect rule, commits and skips alike. Every one
+    /// of them is a leader the direct rule left `Undecided`, so this is the
+    /// count of undecided leader slots the replica has resolved so far.
+    pub fn indirect_decisions(&self) -> u64 {
+        self.indirect_commits() + self.indirect_skips()
+    }
+
     /// Decided leaders of one `commit_type`, summed across leader authorities.
     fn commit_type_total(&self, commit_type: &str) -> u64 {
         let Some(family) = self.find_family(COMMITTED_LEADERS_TOTAL) else {

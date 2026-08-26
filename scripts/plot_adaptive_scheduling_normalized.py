@@ -5,8 +5,13 @@ Per-protocol plots, emitted as THREE separate figures:
   * <protocol>_latency.png  — time-series latency line graph
   * <protocol>_phases.png   — per-phase average bar chart
   * <protocol>_leaders.png  — leaders-per-round trace over time (the adaptive
-    scheduler's reaction, with its lag behind the phase changes annotated);
-    needs the `leaders` CSV column, so it is skipped for older result files
+    scheduler's reaction); needs the `leaders` CSV column, so it is skipped
+    for older result files
+  * <protocol>_timeouts.png — share of rounds in which a validator waited out
+    the leader timeout (mean per validator): the cost of slow or dead leader
+    slots, which is what grows with the leader count; needs the `timeouts`,
+    `direct_commits`, `direct_skips`, `indirect` and `leaders` columns, so it
+    is skipped for older result files
 
 The latency and phase figures share a single y-axis scale that is *normalised
 across every protocol* under the results root, so graphs from different
@@ -74,26 +79,61 @@ def load_csv(path):
     return data, t1, t2
 
 
-def load_leaders_csv(path):
-    """Per-time mean of the `leaders` column over validators, or None for CSVs
+def load_column_csv(path, column):
+    """Per-time mean of an integer `column` over validators, or None for CSVs
     written before the column existed."""
     per_time = defaultdict(list)
     with open(path) as f:
         for row in csv.DictReader(f):
-            if row.get("leaders") in (None, ""):
+            if row.get(column) in (None, ""):
                 return None
-            per_time[int(row["time_s"])].append(int(row["leaders"]))
+            per_time[int(row["time_s"])].append(int(row[column]))
     return {t: sum(v) / len(v) for t, v in per_time.items()}
 
 
-def load_leaders_dir(dirpath):
-    """One `{time: mean leaders}` trace per run in the directory (runs without
+def load_column_dir(dirpath, column):
+    """One `{time: mean value}` trace per run in the directory (runs without
     the column are skipped)."""
     runs = []
     if not os.path.isdir(dirpath):
         return runs
     for fname in sorted(f for f in os.listdir(dirpath) if f.endswith(".csv")):
-        trace = load_leaders_csv(os.path.join(dirpath, fname))
+        trace = load_column_csv(os.path.join(dirpath, fname), column)
+        if trace:
+            runs.append(trace)
+    return runs
+
+
+def load_leaders_dir(dirpath):
+    return load_column_dir(dirpath, "leaders")
+
+
+TIMEOUT_COLUMNS = ("timeouts", "direct_commits", "direct_skips", "indirect", "leaders")
+
+
+def load_timeout_share_csv(path):
+    """Per-time mean over validators of the share of rounds that waited out the
+    leader timeout in the window: `timeouts / rounds`, with the rounds a window
+    covered derived from its decided leader slots (`decisions / leaders`).
+    None for CSVs written before the mechanism columns existed."""
+    per_time = defaultdict(list)
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            if any(row.get(c) in (None, "") for c in TIMEOUT_COLUMNS):
+                return None
+            decisions = int(row["direct_commits"]) + int(row["direct_skips"]) + int(row["indirect"])
+            rounds = decisions / max(int(row["leaders"]), 1)
+            share = min(int(row["timeouts"]) / rounds, 1.0) if rounds > 0 else 0.0
+            per_time[int(row["time_s"])].append(share)
+    return {t: sum(v) / len(v) for t, v in per_time.items()}
+
+
+def load_timeout_share_dir(dirpath):
+    runs = []
+    if not os.path.isdir(dirpath):
+        return runs
+    for fname in sorted(f for f in os.listdir(dirpath) if f.endswith(".csv")):
+        trace = load_timeout_share_csv(os.path.join(dirpath, fname))
         if trace:
             runs.append(trace)
     return runs
@@ -342,18 +382,68 @@ def load_protocol_series(proto_dir, announce=False):
     return series
 
 
-def load_protocol_leaders(proto_dir):
-    """Per-variant leaders traces: list of (label, runs, t1, t2); only variants
-    whose CSVs carry the `leaders` column are included."""
+def load_protocol_column(proto_dir, column):
+    """Per-variant traces of one CSV column: list of (label, runs, t1, t2);
+    only variants whose CSVs carry the column are included."""
     series = []
     for variant, label in VARIANTS:
         dirpath = os.path.join(proto_dir, variant)
-        runs = load_leaders_dir(dirpath)
+        runs = load_column_dir(dirpath, column)
         if not runs:
             continue
         _, t1, t2 = load_csv_dir(dirpath)
         series.append((label, runs, t1, t2))
     return series
+
+
+def load_protocol_leaders(proto_dir):
+    return load_protocol_column(proto_dir, "leaders")
+
+
+def load_protocol_timeout_share(proto_dir):
+    series = []
+    for variant, label in VARIANTS:
+        dirpath = os.path.join(proto_dir, variant)
+        runs = load_timeout_share_dir(dirpath)
+        if not runs:
+            continue
+        _, t1, t2 = load_csv_dir(dirpath)
+        series.append((label, runs, t1, t2))
+    return series
+
+
+def plot_timeouts(series, output, title=None, mid_label="high latency"):
+    """Share of rounds that waited out the leader timeout, per window, mean
+    per validator, pooled over runs. series: list of (label, runs, t1, t2) as
+    from `load_protocol_timeout_share`."""
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    if title:
+        ax.set_title(title, fontweight="bold", fontsize=13, pad=40)
+    t_max = max((t for _, runs, _, _ in series for r in runs for t in r), default=1)
+    t1 = next((t1 for _, _, t1, _ in series if t1 is not None), None)
+    t2 = next((t2 for _, _, _, t2 in series if t2 is not None), None)
+    add_phase_shading(ax, t1, t2, t_max, labels=True, mid_label=mid_label)
+    for idx, (label, runs, _, _) in enumerate(series):
+        pooled = defaultdict(list)
+        for run in runs:
+            for t, v in run.items():
+                pooled[t].append(v)
+        times = sorted(pooled)
+        ax.plot(times, [sum(pooled[t]) / len(pooled[t]) for t in times],
+                color=COLORS[idx % len(COLORS)], marker=MARKERS[idx % len(MARKERS)],
+                markersize=3, linewidth=1.5, label=label)
+    ax.set_ylabel("Rounds that waited out\nthe leader timeout", fontweight="bold")
+    ax.set_xlabel("Time (s)", fontweight="bold")
+    ax.set_xlim(0, t_max)
+    ax.set_ylim(0, 1)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=len(series),
+              fontsize=9, frameon=False)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to {output}")
 
 
 def discover_protocols(results_root):
@@ -437,6 +527,11 @@ def main():
             plot_leaders(leaders, f"{prefix}_leaders.png", title, mid_label)
         else:
             print(f"  No `leaders` column in {proto}'s CSVs, skipping the leaders trace")
+        timeouts = load_protocol_timeout_share(proto_dir)
+        if timeouts:
+            plot_timeouts(timeouts, f"{prefix}_timeouts.png", title, mid_label)
+        else:
+            print(f"  No `timeouts` column in {proto}'s CSVs, skipping the timeouts figure")
 
 
 if __name__ == "__main__":

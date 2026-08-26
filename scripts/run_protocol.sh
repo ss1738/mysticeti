@@ -75,7 +75,7 @@ for scenario in "${SCENARIOS[@]}"; do
                 echo "--- [$scenario/$proto] run $i/$RUNS: $v ---"
                 cargo test -p simulator --test adaptive_scheduling "$v" \
                     -- --ignored --exact --nocapture 2>&1 \
-                    | grep -E "outcome|wrote|Leader scheduler|UNDECIDED-CHECK|FAILED|error" \
+                    | grep -E "outcome|wrote|Leader scheduler|FAILED|error" \
                     || true
             done
         done

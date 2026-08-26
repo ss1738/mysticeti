@@ -23,8 +23,12 @@ pub(crate) struct LeaderScheduler {
     leader_elector: LeaderElector,
     /// Wave length of the active protocol.
     wave_length: RoundNumber,
-    /// Stake threshold for a direct commit under the active protocol.
+    /// Certificates required for a direct commit (the outer threshold).
     direct_commit_quorum: Stake,
+    /// Votes a decision-round block must reference to be a certificate (the
+    /// inner threshold); coincides with `direct_commit_quorum` for single-tier
+    /// protocols but not for dual-path ones such as DagHydrangea.
+    certificate_quorum: Stake,
     /// Whether the active protocol pipelines (a leader every round).
     pipeline: bool,
     /// Upper bound on the leader count.
@@ -47,6 +51,7 @@ impl LeaderScheduler {
             leader_elector,
             wave_length: protocol.wave_length,
             direct_commit_quorum: protocol.direct_commit_quorum,
+            certificate_quorum: protocol.certificate_quorum,
             pipeline: protocol.pipeline,
             max_leaders_per_round: protocol.max_leaders_per_round.get(),
             interval: protocol.scheduler_interval,
@@ -57,7 +62,9 @@ impl LeaderScheduler {
     }
 
     /// Whether `round` is far enough past the last reconfiguration to trigger
-    /// a new one.
+    /// a new one: strictly more than `interval` rounds, so that the next
+    /// measurement window (`interval + 1` rounds ending at the new anchor, see
+    /// `collect_subdag`) starts after the previous anchor's round.
     pub(crate) fn is_schedule_round(&self, round: RoundNumber) -> bool {
         if round == 0 || round <= self.last_round {
             return false;
@@ -109,8 +116,15 @@ impl LeaderScheduler {
         new_value
     }
 
-    /// Collect the sub-dag rooted at `anchor`, walking back at most `interval`
-    /// rounds.
+    /// Collect the sub-dag rooted at `anchor`: the anchor's causal history over
+    /// the `interval + 1` rounds `anchor - interval ..= anchor`.
+    ///
+    /// The top round holds only the anchor itself (the walk descends through
+    /// `includes`), so a leader whose decision round is the anchor round can
+    /// never gather a certificate quorum inside the sub-dag. The leader rounds
+    /// decidable inside it are therefore `anchor - interval ..= anchor - wave_length`,
+    /// `interval - (wave_length - 1)` of them — exactly what
+    /// `calculate_expected_commits` assumes, so the measured rate never exceeds 1.
     fn collect_subdag(&self, block_reader: &BlockReader, anchor: Data<Block>) -> Vec<Data<Block>> {
         // `saturating_sub` guards against underflow when the anchor round is
         // below the interval.
@@ -134,9 +148,12 @@ impl LeaderScheduler {
         subdag
     }
 
-    /// Expected number of direct commits in the analysis window.
+    /// Expected number of direct commits in the analysis window: the leader
+    /// rounds whose decision round lies strictly inside the sub-dag collected by
+    /// `collect_subdag`.
     fn calculate_expected_commits(&self, leaders_per_round: usize) -> u64 {
-        // The two most recent rounds cannot have produced a decision yet.
+        // The top `wave_length - 1` rounds of the window cannot have produced a
+        // decision inside it (the top round holds only the anchor).
         let round_count = self.interval.saturating_sub(self.wave_length - 1);
         let wave_length = if self.pipeline { 1 } else { self.wave_length };
         (round_count * leaders_per_round as u64) / wave_length
@@ -156,6 +173,10 @@ impl LeaderScheduler {
         rounds.dedup();
 
         for round in rounds {
+            // Genesis is never a leader slot (the committer filters it too).
+            if round == 0 {
+                continue;
+            }
             let wave = round / self.wave_length;
             // Without pipelining, only the first round of a wave has leaders.
             if !self.pipeline && wave * self.wave_length != round {
@@ -176,14 +197,15 @@ impl LeaderScheduler {
     }
 
     /// Whether `leader` was directly committed within `blocks`, applying the
-    /// active protocol's wave length and direct-commit quorum.
+    /// active protocol's wave length and quorums.
     ///
     /// Support is propagated transitively: starting from the leader, each round
     /// up to `decision_round - 1` extends the supporter set to blocks that include
     /// any block from the previous supporter set. At `decision_round` (the last
-    /// round of the wave) a block is a certificate if it includes a quorum of
-    /// supporters from the preceding round; a quorum of certificates is a direct
-    /// commit.
+    /// round of the wave) a block is a certificate if it includes
+    /// `certificate_quorum` stake of supporters from the preceding round, and
+    /// `direct_commit_quorum` stake of certificates is a direct commit — the
+    /// same two thresholds `BaseCommitter` applies.
     ///
     /// Wave length 2 is special-cased: the decision round sits one round above
     /// the leader, so votes and certificates coincide (mirroring
@@ -228,7 +250,7 @@ impl LeaderScheduler {
         // from a quorum of stake; a quorum of certificates is a direct commit.
         let mut certificate_stake = StakeAggregator::new(self.direct_commit_quorum);
         for block in blocks.iter().filter(|b| b.round() == decision_round) {
-            let mut vote_stake = StakeAggregator::new(self.direct_commit_quorum);
+            let mut vote_stake = StakeAggregator::new(self.certificate_quorum);
             let has_quorum = supporters
                 .iter()
                 .filter(|s| block.includes().contains(s))
@@ -260,7 +282,12 @@ mod tests {
     // --- helpers -----------------------------------------------------------
 
     /// A Mysticeti protocol (wave 3, pipelined) with the scheduler knobs set.
-    fn mysticeti(committee: &Committee, leaders: usize, max: usize, interval: RoundNumber) -> Protocol {
+    fn mysticeti(
+        committee: &Committee,
+        leaders: usize,
+        max: usize,
+        interval: RoundNumber,
+    ) -> Protocol {
         let mut protocol =
             Protocol::mysticeti(committee.total_stake(), NonZeroUsize::new(leaders).unwrap());
         protocol.max_leaders_per_round = NonZeroUsize::new(max).unwrap();
@@ -278,8 +305,7 @@ mod tests {
 
     /// A Cordial Miners protocol (wave 3, *not* pipelined) with the interval set.
     fn cordial_ps(committee: &Committee, interval: RoundNumber) -> Protocol {
-        let mut protocol =
-            Protocol::cordial_miners_partially_synchronous(committee.total_stake());
+        let mut protocol = Protocol::cordial_miners_partially_synchronous(committee.total_stake());
         protocol.scheduler_interval = interval;
         protocol
     }
@@ -289,7 +315,11 @@ mod tests {
     }
 
     /// The committed leader block for `round` under round-robin election.
-    fn leader_block(reader: &BlockReader, elector: &LeaderElector, round: RoundNumber) -> Data<Block> {
+    fn leader_block(
+        reader: &BlockReader,
+        elector: &LeaderElector,
+        round: RoundNumber,
+    ) -> Data<Block> {
         reader
             .get_blocks_at_authority_round(elector.elect_leader(round), round)
             .into_iter()
@@ -298,7 +328,11 @@ mod tests {
     }
 
     /// Every block in rounds `lo..=hi`, the slice the decision helpers consume.
-    fn blocks_in_rounds(reader: &BlockReader, lo: RoundNumber, hi: RoundNumber) -> Vec<Data<Block>> {
+    fn blocks_in_rounds(
+        reader: &BlockReader,
+        lo: RoundNumber,
+        hi: RoundNumber,
+    ) -> Vec<Data<Block>> {
         (lo..=hi)
             .flat_map(|round| reader.get_blocks_by_round(round))
             .collect()
@@ -332,10 +366,19 @@ mod tests {
         let committee = committee(4);
         let scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
 
-        assert!(!scheduler.is_schedule_round(0), "round 0 is never a schedule round");
+        assert!(
+            !scheduler.is_schedule_round(0),
+            "round 0 is never a schedule round"
+        );
         assert!(!scheduler.is_schedule_round(1));
-        assert!(!scheduler.is_schedule_round(10), "exactly `interval` away is not yet due");
-        assert!(scheduler.is_schedule_round(11), "one past `interval` is due");
+        assert!(
+            !scheduler.is_schedule_round(10),
+            "exactly `interval` away is not yet due"
+        );
+        assert!(
+            scheduler.is_schedule_round(11),
+            "one past `interval` is due"
+        );
         assert!(scheduler.is_schedule_round(100));
     }
 
@@ -344,12 +387,16 @@ mod tests {
     #[test]
     fn is_schedule_round_slides_with_last_round() {
         let committee = committee(4);
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
         scheduler.last_round = 50;
 
         assert!(!scheduler.is_schedule_round(40), "before last_round");
         assert!(!scheduler.is_schedule_round(50), "exactly at last_round");
-        assert!(!scheduler.is_schedule_round(60), "exactly `interval` past last_round");
+        assert!(
+            !scheduler.is_schedule_round(60),
+            "exactly `interval` past last_round"
+        );
         assert!(scheduler.is_schedule_round(61), "one past the window");
     }
 
@@ -435,7 +482,10 @@ mod tests {
         let subdag = scheduler.collect_subdag(&reader, anchor);
 
         let min = subdag.iter().map(|block| block.round()).min().unwrap();
-        assert_eq!(min, 0, "until = 5.saturating_sub(10) = 0, so genesis is included");
+        assert_eq!(
+            min, 0,
+            "until = 5.saturating_sub(10) = 0, so genesis is included"
+        );
     }
 
     // --- is_directly_committed --------------------------------------------
@@ -536,7 +586,10 @@ mod tests {
         let subdag = scheduler.collect_subdag(&reader, anchor);
         let expected = scheduler.calculate_expected_commits(1);
         assert_eq!(expected, 8);
-        assert_eq!(scheduler.count_direct_commits(&subdag, &reader, 1) as u64, expected);
+        assert_eq!(
+            scheduler.count_direct_commits(&subdag, &reader, 1) as u64,
+            expected
+        );
     }
 
     /// Same, with five leaders per round on a committee of 10 (offsets 0..5
@@ -554,7 +607,10 @@ mod tests {
         let subdag = scheduler.collect_subdag(&reader, anchor);
         let expected = scheduler.calculate_expected_commits(5);
         assert_eq!(expected, 40);
-        assert_eq!(scheduler.count_direct_commits(&subdag, &reader, 5) as u64, expected);
+        assert_eq!(
+            scheduler.count_direct_commits(&subdag, &reader, 5) as u64,
+            expected
+        );
     }
 
     /// A degraded DAG commits nothing, for any leader count.
@@ -584,7 +640,8 @@ mod tests {
         build_dag(&committee, &mut storage, None, 12);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
 
         let anchor = leader_block(&reader, &elector, 12);
         assert_eq!(scheduler.update_leader(&reader, anchor), 2);
@@ -601,7 +658,8 @@ mod tests {
         build_dag(&committee, &mut storage, None, 12);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
 
         let anchor = leader_block(&reader, &elector, 12);
         assert_eq!(scheduler.update_leader(&reader, anchor), 5, "capped at max");
@@ -617,7 +675,8 @@ mod tests {
         build_degraded_dag(&committee, &mut storage, 12);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 4, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 4, 5, 10), committee.clone());
 
         let anchor = leader_block(&reader, &elector, 12);
         assert_eq!(scheduler.update_leader(&reader, anchor), 3);
@@ -634,7 +693,8 @@ mod tests {
         build_degraded_dag(&committee, &mut storage, 12);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 5, 5, 10), committee.clone());
 
         let anchor = leader_block(&reader, &elector, 12);
         assert_eq!(scheduler.update_leader(&reader, anchor.clone()), 4); // -1
@@ -652,7 +712,8 @@ mod tests {
         build_degraded_dag(&committee, &mut storage, 12);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 1, 5, 10), committee.clone());
 
         let anchor = leader_block(&reader, &elector, 12);
         assert_eq!(scheduler.update_leader(&reader, anchor.clone()), 1);
@@ -668,11 +729,16 @@ mod tests {
         build_dag(&committee, &mut storage, None, 12);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 2, 5, 10), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 2, 5, 10), committee.clone());
         scheduler.consecutive_decreases = 3; // pretend we had been backing off
 
         let anchor = leader_block(&reader, &elector, 12);
-        assert_eq!(scheduler.update_leader(&reader, anchor), 3, "additive, not jumped");
+        assert_eq!(
+            scheduler.update_leader(&reader, anchor),
+            3,
+            "additive, not jumped"
+        );
         assert_eq!(scheduler.consecutive_decreases, 0);
     }
 
@@ -686,7 +752,8 @@ mod tests {
         build_dag(&committee, &mut storage, None, 5);
         let reader = storage.block_reader().clone();
         let elector = LeaderElector::new(committee.len());
-        let mut scheduler = LeaderScheduler::new(&mysticeti(&committee, 3, 5, 2), committee.clone());
+        let mut scheduler =
+            LeaderScheduler::new(&mysticeti(&committee, 3, 5, 2), committee.clone());
         scheduler.consecutive_decreases = 2;
 
         let anchor = leader_block(&reader, &elector, 4);

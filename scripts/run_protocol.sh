@@ -21,7 +21,7 @@
 # must all come from the same configuration to be comparable.
 set -u
 
-ALL_PROTOCOLS=(mysticeti blue-bottle nemo-nemo mahi-mahi-4 mahi-mahi-5)
+ALL_PROTOCOLS=(mysticeti blue-bottle nemo-nemo mahi-mahi-4 mahi-mahi-5 dag-hydrangea)
 RUNS=9
 RESULTS_ROOT="crates/simulator/results"
 

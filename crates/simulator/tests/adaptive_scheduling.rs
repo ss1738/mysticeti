@@ -89,6 +89,23 @@ fn nemo_nemo(leader_count: usize, adaptive_scheduler: bool) -> ConsensusProtocol
     }
 }
 
+/// DagHydrangea protocol selection with explicit scheduler settings, at the
+/// fault configuration that matches the other protocols on a 10-validator
+/// committee: `f = 3, c = 0, k = 0` meets its bound `n >= 3f + 2c + k + 1`
+/// exactly, and its quorum `n - f - c = 7` tolerates the same three slow or
+/// crashed validators as Mysticeti.
+fn dag_hydrangea(leader_count: usize, adaptive_scheduler: bool) -> ConsensusProtocol {
+    ConsensusProtocol::DagHydrangea {
+        leader_count: NonZeroUsize::new(leader_count).expect("leader_count must be non-zero"),
+        f: 3,
+        c: 0,
+        k: 0,
+        adaptive_scheduler,
+        max_leaders_per_round: NonZeroUsize::new(5).unwrap(),
+        scheduler_interval: 25,
+    }
+}
+
 /// Mahi-Mahi protocol selection with explicit wave length and scheduler settings.
 fn mahi_mahi(leader_count: usize, wave_length: u64, adaptive_scheduler: bool) -> ConsensusProtocol {
     ConsensusProtocol::MahiMahi {
@@ -366,8 +383,9 @@ fn mysticeti_fixed_5() {
 // `results/crash/<protocol>/` folder (so it gets its own pooled graph). The
 // crash count is capped at each protocol's fault tolerance (`n - commit_quorum`)
 // at COMMITTEE_SIZE = 10, so the live set is still a quorum and consensus stays
-// live: mysticeti / mahi-mahi tolerate 3, nemo-nemo 4 (we use 3), and
-// blue-bottle only 1 (its `4n/5+1 = 9` quorum must stay live).
+// live: mysticeti / mahi-mahi / dag-hydrangea (f=3, c=0, k=0) tolerate 3,
+// nemo-nemo 4 (we use 3), and blue-bottle only 1 (its `4n/5+1 = 9` quorum
+// must stay live).
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh crash"]
@@ -460,6 +478,24 @@ fn mahi_mahi_5_crash_fixed_5() {
 }
 
 #[test]
+#[ignore = "long-running experiment; run via scripts/run_protocol.sh crash"]
+fn dag_hydrangea_crash_adaptive() {
+    run_crash_variant("dag-hydrangea", "adaptive", dag_hydrangea(5, true), 3);
+}
+
+#[test]
+#[ignore = "long-running experiment; run via scripts/run_protocol.sh crash"]
+fn dag_hydrangea_crash_fixed_1() {
+    run_crash_variant("dag-hydrangea", "fixed_1", dag_hydrangea(1, false), 3);
+}
+
+#[test]
+#[ignore = "long-running experiment; run via scripts/run_protocol.sh crash"]
+fn dag_hydrangea_crash_fixed_5() {
+    run_crash_variant("dag-hydrangea", "fixed_5", dag_hydrangea(5, false), 3);
+}
+
+#[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn blue_bottle_adaptive() {
     run_variant("blue-bottle", "adaptive", blue_bottle(5, true), 1);
@@ -529,6 +565,24 @@ fn mahi_mahi_5_fixed_1() {
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_5_fixed_5() {
     run_variant("mahi-mahi-5", "fixed_5", mahi_mahi(5, 5, false), 3);
+}
+
+#[test]
+#[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
+fn dag_hydrangea_adaptive() {
+    run_variant("dag-hydrangea", "adaptive", dag_hydrangea(5, true), 3);
+}
+
+#[test]
+#[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
+fn dag_hydrangea_fixed_1() {
+    run_variant("dag-hydrangea", "fixed_1", dag_hydrangea(1, false), 3);
+}
+
+#[test]
+#[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
+fn dag_hydrangea_fixed_5() {
+    run_variant("dag-hydrangea", "fixed_5", dag_hydrangea(5, false), 3);
 }
 
 #[test]

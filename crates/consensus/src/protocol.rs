@@ -83,6 +83,14 @@ pub enum ConsensusProtocol {
         c: Stake,
         /// Tunable slack widening the fast path; requires `n >= 3f + 2c + k + 1`.
         k: Stake,
+        /// Enable the adaptive leader scheduler, which tunes the
+        /// number of leaders per round based on observed commit rate.
+        #[serde(default)]
+        adaptive_scheduler: bool,
+        #[serde(default = "defaults::default_max_leaders_per_round")]
+        max_leaders_per_round: NonZeroUsize,
+        #[serde(default = "defaults::default_scheduler_interval")]
+        scheduler_interval: RoundNumber,
     },
 }
 
@@ -191,11 +199,14 @@ impl fmt::Display for ConsensusProtocol {
                 f,
                 c,
                 k,
+                adaptive_scheduler,
+                ..
             } => {
                 write!(
                     fmt,
-                    "DagHydrangea ({} leaders/round, f={f}, c={c}, k={k})",
-                    leader_count
+                    "DagHydrangea ({} leaders/round, f={f}, c={c}, k={k}{})",
+                    leader_count,
+                    adaptive_label(*adaptive_scheduler)
                 )
             }
         }
@@ -264,7 +275,13 @@ impl fmt::Debug for ConsensusProtocol {
                 f,
                 c,
                 k,
-            } => write!(fmt, "dag-hydrangea-l{leader_count}-f{f}-c{c}-k{k}"),
+                adaptive_scheduler,
+                ..
+            } => write!(
+                fmt,
+                "dag-hydrangea-l{leader_count}-f{f}-c{c}-k{k}{}",
+                adaptive_suffix(*adaptive_scheduler)
+            ),
         }
     }
 }
@@ -346,7 +363,14 @@ impl ConsensusProtocol {
                 f,
                 c,
                 k,
-            } => Protocol::dag_hydrangea(total_stake, f, c, k, leader_count)?,
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            } => Protocol::dag_hydrangea(total_stake, f, c, k, leader_count)?.with_scheduler(
+                adaptive_scheduler,
+                max_leaders_per_round,
+                scheduler_interval,
+            ),
         })
     }
 }
@@ -416,12 +440,18 @@ impl ConsensusProtocol {
                 f: 1,
                 c: 0,
                 k: 0,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
             });
             variants.push(Self::DagHydrangea {
                 leader_count,
                 f: 0,
                 c: 1,
                 k: 1,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
             });
             if n >= 20 {
                 variants.push(Self::DagHydrangea {
@@ -429,24 +459,36 @@ impl ConsensusProtocol {
                     f: 6,
                     c: 0,
                     k: 1,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
                 variants.push(Self::DagHydrangea {
                     leader_count,
                     f: 0,
                     c: 9,
                     k: 1,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
                 variants.push(Self::DagHydrangea {
                     leader_count,
                     f: 3,
                     c: 4,
                     k: 2,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
                 variants.push(Self::DagHydrangea {
                     leader_count,
                     f: 4,
                     c: 1,
                     k: 5,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
             }
         }
@@ -466,12 +508,18 @@ impl ConsensusProtocol {
                 f: 1,
                 c: 0,
                 k: 0,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
             });
             variants.push(Self::DagHydrangea {
                 leader_count,
                 f: 0,
                 c: 1,
                 k: 1,
+                adaptive_scheduler: false,
+                max_leaders_per_round: leader_count,
+                scheduler_interval: defaults::default_scheduler_interval(),
             });
             if n >= 20 {
                 variants.push(Self::DagHydrangea {
@@ -479,24 +527,36 @@ impl ConsensusProtocol {
                     f: 6,
                     c: 0,
                     k: 1,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
                 variants.push(Self::DagHydrangea {
                     leader_count,
                     f: 0,
                     c: 9,
                     k: 1,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
                 variants.push(Self::DagHydrangea {
                     leader_count,
                     f: 3,
                     c: 4,
                     k: 2,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
                 variants.push(Self::DagHydrangea {
                     leader_count,
                     f: 4,
                     c: 1,
                     k: 5,
+                    adaptive_scheduler: false,
+                    max_leaders_per_round: leader_count,
+                    scheduler_interval: defaults::default_scheduler_interval(),
                 });
             }
         }

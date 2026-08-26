@@ -14,7 +14,8 @@ use super::names::{
     BLOCK_SYNC_REQUESTS_SENT, COMMITTED_LEADERS_TOTAL, CORE_LOCK_DEQUEUED, CORE_LOCK_ENQUEUED,
     CORE_LOCK_UTIL, GLOBAL_IN_MEMORY_BLOCKS, GLOBAL_IN_MEMORY_BLOCKS_BYTES, INTER_BLOCK_LATENCY_S,
     LABEL_AUTHORITY, LABEL_COMMIT_TYPE, LABEL_FULFILLED, LABEL_PROC, LATENCY_S, LATENCY_SQUARED_S,
-    LEADER_TIMEOUT_TOTAL, MISSING_BLOCKS, SUBMITTED_TRANSACTIONS, UTILIZATION_TIMER, WAL_MAPPINGS,
+    LEADER_TIMEOUT_TOTAL, LEADERS_PER_ROUND, MISSING_BLOCKS, SUBMITTED_TRANSACTIONS,
+    UTILIZATION_TIMER, WAL_MAPPINGS,
 };
 
 const LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -27,6 +28,9 @@ pub(super) struct CoarseMetrics {
     pub latency_squared_s: Counter,
     pub committed_leaders_total: IntCounterVec,
     pub leader_timeout_total: IntCounter,
+    /// Leaders elected per round by the consensus committer; changes over time
+    /// when the adaptive leader scheduler is enabled.
+    pub leaders_per_round: IntGauge,
     pub inter_block_latency_s: Histogram,
 
     pub block_store_unloaded_blocks: IntCounter,
@@ -95,6 +99,12 @@ impl CoarseMetrics {
             leader_timeout_total: register_int_counter_with_registry!(
                 LEADER_TIMEOUT_TOTAL,
                 "Total number of leader timeouts",
+                registry,
+            )
+            .unwrap(),
+            leaders_per_round: register_int_gauge_with_registry!(
+                LEADERS_PER_ROUND,
+                "Leaders elected per round by the consensus committer",
                 registry,
             )
             .unwrap(),

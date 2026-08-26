@@ -234,7 +234,9 @@ impl SimulationState {
                 elapsed_total += step;
 
                 for (validator, metrics) in self.metrics.iter().enumerate() {
-                    let latency = metrics.collect().precise_committed_latency();
+                    let snapshot = metrics.collect();
+                    let latency = snapshot.precise_committed_latency();
+                    let leaders = snapshot.leaders_per_round();
                     let (previous_sum, previous_count) = previous[validator];
                     let delta_count = latency.cumulative_count.saturating_sub(previous_count);
                     let avg_ms = if delta_count > 0 {
@@ -242,14 +244,15 @@ impl SimulationState {
                     } else {
                         0.0
                     };
-                    previous[validator] =
-                        (latency.cumulative_sum_ms, latency.cumulative_count);
+                    previous[validator] = (latency.cumulative_sum_ms, latency.cumulative_count);
                     samples.push(LatencySample {
                         time_s: elapsed_total,
                         validator,
                         p90_ms: latency.p90_ms.round() as u64,
                         avg_ms: avg_ms.round() as u64,
                         phase: phase_number,
+                        commits: delta_count,
+                        leaders,
                     });
                 }
             }
@@ -312,13 +315,9 @@ impl SimulationState {
             .collect();
         let storages: Vec<Storage> = syncers.into_iter().map(Syncer::into_storage).collect();
 
-        Ok(RunResult::new(
-            metrics,
-            storages,
-            config,
-            duration,
-            RunKind::Simulation,
+        Ok(
+            RunResult::new(metrics, storages, config, duration, RunKind::Simulation)
+                .with_latency_series(latency_series),
         )
-        .with_latency_series(latency_series))
     }
 }

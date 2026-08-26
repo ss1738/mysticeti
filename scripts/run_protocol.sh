@@ -16,6 +16,9 @@
 # results/<set>/<protocol>/<variant>/, so re-running simply adds more runs to the
 # pool. Runs are sequential so each sees the previous run's CSV — the in-test
 # `run_index` then auto-increments, giving every run a distinct rotation/seed.
+# Clear the pool (rm -r crates/simulator/results/<set>) whenever the scenario,
+# the simulator's network model or the latency metric changes — pooled runs
+# must all come from the same configuration to be comparable.
 set -u
 
 ALL_PROTOCOLS=(mysticeti blue-bottle nemo-nemo mahi-mahi-4 mahi-mahi-5)

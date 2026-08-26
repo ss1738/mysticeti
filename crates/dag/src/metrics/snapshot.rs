@@ -8,7 +8,7 @@ use prometheus::{Encoder, TextEncoder, proto::MetricFamily};
 use super::names::{
     COMMIT_TYPE_DIRECT_COMMIT, COMMIT_TYPE_DIRECT_SKIP, COMMIT_TYPE_INDIRECT_COMMIT,
     COMMIT_TYPE_INDIRECT_SKIP, COMMITTED_LEADERS_TOTAL, LABEL_COMMIT_TYPE, LATENCY_S,
-    LEADER_TIMEOUT_TOTAL, TRANSACTION_COMMITTED_LATENCY,
+    LEADER_TIMEOUT_TOTAL, LEADERS_PER_ROUND, TRANSACTION_COMMITTED_LATENCY,
 };
 
 /// Windowed + cumulative view of the precise committed-transaction latency
@@ -42,6 +42,12 @@ impl MetricsSnapshot {
     /// Number of leader timeouts observed by this replica.
     pub fn leader_timeouts(&self) -> u64 {
         self.scalar_value(LEADER_TIMEOUT_TOTAL, &[]) as u64
+    }
+
+    /// Leaders per round the committer was electing when the snapshot was
+    /// taken (varies over time under the adaptive leader scheduler).
+    pub fn leaders_per_round(&self) -> u64 {
+        self.scalar_value(LEADERS_PER_ROUND, &[]) as u64
     }
 
     /// Percentile `p` (in `0.0..=1.0`) of this replica's committed-transaction latency
@@ -149,8 +155,7 @@ impl MetricsSnapshot {
             p90_ms: read_ms("p90"),
             p99_ms: read_ms("p99"),
             cumulative_sum_ms: read_ms("sum"),
-            cumulative_count: self
-                .scalar_value(TRANSACTION_COMMITTED_LATENCY, &[("v", "count")])
+            cumulative_count: self.scalar_value(TRANSACTION_COMMITTED_LATENCY, &[("v", "count")])
                 as u64,
         }
     }

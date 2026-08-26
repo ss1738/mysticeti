@@ -14,6 +14,7 @@ pub const LATENCY_SQUARED_S: &str = "latency_squared_s";
 pub const INTER_BLOCK_LATENCY_S: &str = "inter_block_latency_s";
 pub const COMMITTED_LEADERS_TOTAL: &str = "committed_leaders_total";
 pub const LEADER_TIMEOUT_TOTAL: &str = "leader_timeout_total";
+pub const LEADERS_PER_ROUND: &str = "leaders_per_round";
 pub const SUBMITTED_TRANSACTIONS: &str = "submitted_transactions";
 pub const MISSING_BLOCKS: &str = "missing_blocks";
 pub const BLOCK_SYNC_REQUESTS_SENT: &str = "block_sync_requests_sent";

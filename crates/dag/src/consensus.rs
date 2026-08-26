@@ -39,6 +39,11 @@ pub trait DagConsensus: Send + 'static {
     /// Returns `None` for asynchronous protocols where
     /// the DAG should wait for all authorities equally.
     fn get_leaders(&self, round: RoundNumber) -> Option<impl Iterator<Item = Authority>>;
+
+    /// Number of leaders currently elected per round.
+    /// Constant for fixed protocols; changes over time
+    /// under the adaptive leader scheduler.
+    fn leaders_per_round(&self) -> usize;
 }
 
 /// The status of every leader output by the committers. While the core only cares about committed

@@ -105,8 +105,17 @@ impl SimulatedNetwork {
     }
 
     /// Spawn a latency task that delays each message by a random draw from
-    /// `latency` before forwarding it. The returned kill sender, when dropped,
-    /// makes the task exit.
+    /// `latency` before forwarding it.
+    ///
+    /// The link models *propagation delay*, not a serial pipe: every message
+    /// is scheduled for delivery at `now + delay` (never earlier than the
+    /// message before it, so the link stays FIFO) and many messages can be in
+    /// flight at once. Sleeping per message instead would cap the link at one
+    /// message per `delay` — a 1-s link could then carry at most ~1 block/s
+    /// and would throttle the whole DAG rather than delay it.
+    ///
+    /// The returned kill sender, when dropped, makes the task stop accepting
+    /// messages; messages already in flight are still delivered.
     fn latency_channel<T: Send + 'static + Debug>(
         latency: Range<Duration>,
     ) -> (mpsc::Sender<T>, mpsc::Receiver<T>, mpsc::Sender<()>) {
@@ -114,16 +123,22 @@ impl SimulatedNetwork {
         let (sender, receiver) = mpsc::channel(16);
         let (kill_sender, mut kill_receiver) = mpsc::channel::<()>(1);
         SimulatorContext::spawn(async move {
+            let mut last_delivery = Duration::ZERO;
             loop {
                 tokio::select! {
                     message = buf_receiver.recv() => {
                         let Some(message) = message else { return };
                         let delay =
                             SimulatorContext::with_rng(|rng| rng.gen_range(latency.clone()));
-                        SimulatorContext::sleep(delay).await;
-                        if sender.send(message).await.is_err() {
-                            return;
-                        }
+                        let now = SimulatorContext::time();
+                        let deliver_at =
+                            (now + delay).max(last_delivery + Duration::from_nanos(1));
+                        last_delivery = deliver_at;
+                        let sender = sender.clone();
+                        SimulatorContext::spawn(async move {
+                            SimulatorContext::sleep(deliver_at - now).await;
+                            sender.send(message).await.ok();
+                        });
                     }
                     _ = kill_receiver.recv() => return,
                 }

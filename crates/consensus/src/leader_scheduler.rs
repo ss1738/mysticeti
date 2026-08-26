@@ -250,7 +250,6 @@ mod tests {
         block::{Block, RoundNumber},
         committee::Committee,
         data::Data,
-        metrics::Metrics,
         storage::{BlockReader, Storage},
         test_util::{build_dag, build_dag_layer, committee},
     };
@@ -286,7 +285,7 @@ mod tests {
     }
 
     fn new_storage(committee: &Committee) -> Storage {
-        Storage::new_for_tests(Authority::new(0), Metrics::new_for_test(committee.len()), committee).0
+        Storage::new_for_test(committee)
     }
 
     /// The committed leader block for `round` under round-robin election.

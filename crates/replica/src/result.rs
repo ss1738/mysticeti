@@ -131,7 +131,7 @@ pub struct RunResult<C> {
 
 /// One per-replica latency observation taken during a phased simulation run.
 /// The field set mirrors the CSV columns consumed by the plotting scripts:
-/// `time_s,validator,p90_ms,avg_ms,phase`.
+/// `time_s,validator,p90_ms,avg_ms,phase,commits,leaders`.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct LatencySample {
     /// Simulated seconds since the run started.
@@ -140,10 +140,17 @@ pub struct LatencySample {
     pub validator: usize,
     /// 90th-percentile committed-transaction latency over the window, in ms.
     pub p90_ms: u64,
-    /// Mean committed-transaction latency over the window, in ms.
+    /// Mean committed-transaction latency over the window, in ms. `0` when
+    /// nothing was committed in the window (see `commits`).
     pub avg_ms: u64,
     /// 1-based index of the scenario phase this sample belongs to.
     pub phase: u8,
+    /// Number of this replica's own transactions committed in the window —
+    /// the count behind `avg_ms`, so stalled windows are visible as `0`.
+    pub commits: u64,
+    /// Leaders per round the replica's committer was electing at sample time;
+    /// the adaptive scheduler's trace.
+    pub leaders: u64,
 }
 
 impl<C> RunResult<C> {

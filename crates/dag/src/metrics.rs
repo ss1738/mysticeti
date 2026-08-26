@@ -77,6 +77,10 @@ impl Metrics {
         self.coarse.leader_timeout_total.inc();
     }
 
+    pub fn set_leaders_per_round(&self, leaders: usize) {
+        self.coarse.leaders_per_round.set(leaders as i64);
+    }
+
     pub fn inc_core_lock_enqueued(&self) {
         self.coarse.core_lock_enqueued.inc();
     }

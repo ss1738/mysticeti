@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Per-protocol plots, emitted as TWO separate figures:
+Per-protocol plots, emitted as THREE separate figures:
 
   * <protocol>_latency.png  — time-series latency line graph
   * <protocol>_phases.png   — per-phase average bar chart
+  * <protocol>_leaders.png  — leaders-per-round trace over time (the adaptive
+    scheduler's reaction, with its lag behind the phase changes annotated);
+    needs the `leaders` CSV column, so it is skipped for older result files
 
-Both figures share a single y-axis scale that is *normalised across every
-protocol* under the results root, so graphs from different protocols are
-directly comparable. Each figure still covers one protocol (the adaptive
-scheduler vs fixed leader counts of 1 and 5).
+The latency and phase figures share a single y-axis scale that is *normalised
+across every protocol* under the results root, so graphs from different
+protocols are directly comparable. Each figure still covers one protocol (the
+adaptive scheduler vs fixed leader counts of 1 and 5).
 
 Reads the CSVs produced by the `adaptive_scheduling` integration test
 (`crates/simulator/tests/adaptive_scheduling.rs`).
@@ -69,6 +72,31 @@ def load_csv(path):
             t2 = t
 
     return data, t1, t2
+
+
+def load_leaders_csv(path):
+    """Per-time mean of the `leaders` column over validators, or None for CSVs
+    written before the column existed."""
+    per_time = defaultdict(list)
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            if row.get("leaders") in (None, ""):
+                return None
+            per_time[int(row["time_s"])].append(int(row["leaders"]))
+    return {t: sum(v) / len(v) for t, v in per_time.items()}
+
+
+def load_leaders_dir(dirpath):
+    """One `{time: mean leaders}` trace per run in the directory (runs without
+    the column are skipped)."""
+    runs = []
+    if not os.path.isdir(dirpath):
+        return runs
+    for fname in sorted(f for f in os.listdir(dirpath) if f.endswith(".csv")):
+        trace = load_leaders_csv(os.path.join(dirpath, fname))
+        if trace:
+            runs.append(trace)
+    return runs
 
 
 def load_csv_dir(dirpath):
@@ -149,6 +177,86 @@ def add_phase_shading(ax, t1, t2, t_max, labels=True, mid_label="high latency"):
 
 COLORS  = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
 MARKERS = ["o", "s", "^", "D"]
+
+
+def leader_lag(pooled, t1, t2):
+    """Measure the scheduler's lag from a pooled `{time: mean leaders}` trace:
+    (first back-off after t1, time the trace settles at its phase-2 minimum,
+    first time after t2 it is back at the healthy level). Each entry is
+    None when the event does not occur."""
+    if not pooled or t1 is None or t2 is None:
+        return None, None, None
+    times = sorted(pooled)
+    healthy = [pooled[t] for t in times if t < t1]
+    if not healthy:
+        return None, None, None
+    level = sum(healthy) / len(healthy)
+    mid = [t for t in times if t1 <= t < t2]
+    first_backoff = next((t for t in mid if pooled[t] < level - 0.5), None)
+    settled = None
+    if mid:
+        floor = min(pooled[t] for t in mid)
+        settled = next((t for t in mid if pooled[t] <= floor + 0.25), None)
+    recovered = next((t for t in times if t >= t2 and pooled[t] >= level - 0.25), None)
+    return first_backoff, settled, recovered
+
+
+def plot_leaders(series, output, title=None, mid_label="high latency"):
+    """Leaders-per-round trace. series: list of (label, runs, t1, t2) where
+    `runs` is a list of per-run `{time: mean leaders}` traces."""
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    if title:
+        ax.set_title(title, fontweight="bold", fontsize=13, pad=40)
+
+    t_max = max((t for _, runs, _, _ in series for r in runs for t in r), default=1)
+    t1 = next((t1 for _, _, t1, _ in series if t1 is not None), None)
+    t2 = next((t2 for _, _, _, t2 in series if t2 is not None), None)
+    add_phase_shading(ax, t1, t2, t_max, labels=True, mid_label=mid_label)
+
+    for idx, (label, runs, _, _) in enumerate(series):
+        color = COLORS[idx % len(COLORS)]
+        pooled = defaultdict(list)
+        for run in runs:
+            for t, v in run.items():
+                pooled[t].append(v)
+        pooled = {t: sum(v) / len(v) for t, v in pooled.items()}
+        times = sorted(pooled)
+        values = [pooled[t] for t in times]
+        if max(values) == min(values):
+            # A fixed leader count is a constant: draw it as a thin dashed
+            # reference line underneath so it never hides the adaptive trace.
+            ax.axhline(values[0], color=color, linestyle="--", linewidth=1.2,
+                       alpha=0.8, zorder=1, label=label)
+            continue
+        for run in runs:
+            run_times = sorted(run)
+            ax.step(run_times, [run[t] for t in run_times], where="post",
+                    color=color, linewidth=0.8, alpha=0.25, zorder=2)
+        ax.step(times, values, where="post", color=color, linewidth=2.8,
+                zorder=3, label=label)
+        first_backoff, settled, recovered = leader_lag(pooled, t1, t2)
+        if first_backoff is not None:
+            parts = [f"first back-off t1+{first_backoff - t1:.0f}s"]
+            if settled is not None:
+                parts.append(f"settled t1+{settled - t1:.0f}s")
+            parts.append(f"recovered t2+{recovered - t2:.0f}s" if recovered is not None
+                         else "not recovered by end of run")
+            print(f"  {label} lag: " + ", ".join(parts))
+
+    ax.set_ylabel("Leaders per round", fontweight="bold")
+    ax.set_xlabel("Time (s)", fontweight="bold")
+    ax.set_xlim(0, t_max)
+    ax.set_ylim(0.5, max(5.5, ax.get_ylim()[1]))
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    # Legend below the axes so it never covers the traces.
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=len(series),
+              fontsize=9, frameon=False)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to {output}")
 
 
 def plot_timeseries(series, output, ymax, title=None, mid_label="high latency"):
@@ -234,6 +342,20 @@ def load_protocol_series(proto_dir, announce=False):
     return series
 
 
+def load_protocol_leaders(proto_dir):
+    """Per-variant leaders traces: list of (label, runs, t1, t2); only variants
+    whose CSVs carry the `leaders` column are included."""
+    series = []
+    for variant, label in VARIANTS:
+        dirpath = os.path.join(proto_dir, variant)
+        runs = load_leaders_dir(dirpath)
+        if not runs:
+            continue
+        _, t1, t2 = load_csv_dir(dirpath)
+        series.append((label, runs, t1, t2))
+    return series
+
+
 def discover_protocols(results_root):
     """Protocol folders under results_root that hold at least one variant directory."""
     if not os.path.isdir(results_root):
@@ -310,6 +432,11 @@ def main():
         title = f"{pretty_protocol(proto)} — {scenario_display}"
         plot_timeseries(series, f"{prefix}_latency.png", ymax, title, mid_label)
         plot_phases(series,     f"{prefix}_phases.png",  ymax, title, mid_label)
+        leaders = load_protocol_leaders(proto_dir)
+        if leaders:
+            plot_leaders(leaders, f"{prefix}_leaders.png", title, mid_label)
+        else:
+            print(f"  No `leaders` column in {proto}'s CSVs, skipping the leaders trace")
 
 
 if __name__ == "__main__":

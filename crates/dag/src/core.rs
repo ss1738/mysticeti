@@ -140,6 +140,8 @@ impl<C: Ctx, D: DagConsensus> Core<C, D> {
             this.run_block_handler();
         }
 
+        this.metrics
+            .set_leaders_per_round(this.committer.leaders_per_round());
         this
     }
 
@@ -305,6 +307,10 @@ impl<C: Ctx, D: DagConsensus> Core<C, D> {
             .filter_map(LeaderStatus::into_decided_block)
             .collect();
         self.last_decided = latest;
+        // The adaptive scheduler may have reconfigured the committer during
+        // this call; publish the count so time-series samplers can trace it.
+        self.metrics
+            .set_leaders_per_round(self.committer.leaders_per_round());
         sequence
     }
 

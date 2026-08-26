@@ -101,7 +101,7 @@ mod defaults {
     }
 
     pub fn default_scheduler_interval() -> RoundNumber {
-        50
+        25
     }
 
     pub fn deserialize_mahi_mahi_wave_length<'de, D: Deserializer<'de>>(

@@ -81,14 +81,18 @@ pub struct SimulationPhase {
     pub slow_latency_min_ms: u64,
     #[serde(default = "defaults::slow_latency_max_ms")]
     pub slow_latency_max_ms: u64,
-    /// Validators that do *not* receive a slow validator's blocks in time.
-    /// Only the `slow_validator -> slow_blind` *direction* is degraded; the
-    /// reverse stays fast, so the slow validator keeps receiving blocks and
-    /// producing its own on schedule. Its leader block then reaches just a
-    /// partial quorum — too few for a direct commit, too many for a direct
-    /// skip — leaving the leader *undecided* and stalling the commit pipeline.
-    /// Empty means every direction touching a slow validator is degraded (the
-    /// leader then reaches no one and is cleanly skipped instead).
+    /// Validators that receive a slow validator's blocks late. Only the
+    /// `slow_validator -> slow_blind` *direction* is degraded; the reverse
+    /// stays fast, so the slow validator keeps receiving blocks and producing
+    /// its own on schedule, and its blocks reach the rest of the committee in
+    /// time. Whether its leader block then lands at the blind validators
+    /// before or after their round timeout decides between a direct commit
+    /// and a 5/5 vote split (*undecided*), and that race is won more often
+    /// the more leaders the committee is waiting for — so this mode does not
+    /// make extra leader slots costly. Empty (the default) degrades every
+    /// direction touching a slow validator: its leader blocks arrive rounds
+    /// late everywhere and are cleanly skipped, at the price of one leader
+    /// timeout per round that has a slow leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slow_blind: Vec<usize>,
     pub duration_secs: u64,
@@ -118,16 +122,15 @@ impl SimulationPhase {
     ///
     /// The degraded range is applied *directionally*:
     /// * With `slow_blind` empty, any direction touching a slow validator is
-    ///   degraded — the slow validator is fully isolated.
+    ///   degraded — the slow validator is symmetrically slow. It cannot gather
+    ///   a quorum to build its leader block on time, so that block lands late
+    ///   everywhere and is cleanly skipped.
     /// * Otherwise only the `slow_validator -> slow_blind` direction is
     ///   degraded. The reverse (`slow_blind -> slow_validator`) stays fast, so
     ///   a slow validator still *receives* blocks promptly and keeps producing
-    ///   its own on schedule; only its outgoing leader block is withheld from
-    ///   the blind validators. That leaves the leader on a partial quorum —
-    ///   too few votes to commit, too few blames to skip — i.e. *undecided*.
-    ///   A *symmetric* slowdown would instead stall the slow validator itself:
-    ///   it could not gather a quorum to build its leader block on time, so
-    ///   that block would land late everywhere and be cleanly skipped.
+    ///   its own on schedule; only its outgoing blocks reach the blind
+    ///   validators late. See `slow_blind` for why the resulting vote split
+    ///   depends on the round timeout rather than on the leader count.
     ///
     /// Directions between two slow validators stay fast — they still reach
     /// each other.

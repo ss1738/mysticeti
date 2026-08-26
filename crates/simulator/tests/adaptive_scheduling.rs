@@ -17,19 +17,28 @@
 //!   leader is another slot that can stall when the network is stressed.
 //!
 //! Two stress modes are exercised, as separate `#[ignore]`d experiments:
-//! * **high latency** (`<proto>_adaptive` / `_fixed_*`) — `f` validators' links
-//!   are slowed (and optionally blinded), so their leaders lag but stay alive.
+//! * **high latency** (`<proto>_adaptive` / `_fixed_*`) — every link touching
+//!   a few validators (capped at each protocol's fault tolerance, like the
+//!   crash set) is slowed to ~1 s, so their blocks arrive rounds late and
+//!   their leader slots are cleanly skipped. The cost of a skipped slot is the
+//!   leader timeout every other validator spends waiting for it, and with more
+//!   leaders per round more rounds contain one of the slow leaders — which is
+//!   what the adaptive scheduler should back off from.
 //! * **crash faults** (`<proto>-crash` variants, e.g. `mysticeti_crash_*`) —
 //!   a few validators (capped at each protocol's fault tolerance) are fully
 //!   isolated via a network partition, so their leader slots must be skipped.
-//!   With more leaders per round, more of those slots are dead, so the adaptive
-//!   scheduler should back off here.
+//!   The more leaders per round, the more rounds wait out the timeout for a
+//!   dead leader, so the adaptive scheduler should back off here too.
 //!
-//! Each run writes a `time_s,validator,p90_ms,avg_ms,phase` CSV under
-//! `results/<set>/<protocol>/<variant>/` (`<set>` is `degraded` or `crash`).
+//! Each run writes a `time_s,validator,p90_ms,avg_ms,phase,commits,leaders`
+//! CSV under `results/<set>/<protocol>/<variant>/` (`<set>` is `degraded` or
+//! `crash`); `leaders` is the committer's leaders-per-round at sample time,
+//! i.e. the adaptive scheduler's trace, and `commits` is how many of the
+//! replica's own transactions committed in the window (`0` = stalled).
 //! `scripts/plot_adaptive_scheduling_normalized.py` pools those CSVs into the
-//! per-protocol comparison plot, which shows how `adaptive` tracks each regime
-//! relative to the two fixed baselines.
+//! per-protocol comparison plots (latency over time, per-phase means, and the
+//! leaders-per-round trace with the scheduler's lag), which show how
+//! `adaptive` tracks each regime relative to the two fixed baselines.
 //!
 //! These are long-running experiments, not CI checks. Run them via
 //! `scripts/run_protocol.sh <set> [protocol...]` — `<set>` is `degraded`,
@@ -93,10 +102,9 @@ fn mahi_mahi(leader_count: usize, wave_length: u64, adaptive_scheduler: bool) ->
 
 /// Committee size for the experiment: 3f+1 with f = 3.
 const COMMITTEE_SIZE: usize = 10;
-/// The `f` validators whose blocks propagate slowly in the degraded phase.
+/// Validators whose links are slow in the degraded phase (the first `slow_count`
+/// of this block, rotated by the run index), and the start of the crash set.
 const SLOW_VALIDATORS: [usize; 3] = [7, 8, 9];
-/// Validators kept "blind" to slow-validator blocks in the degraded phase.
-const BLIND_VALIDATORS: [usize; 5] = [0, 1, 2, 3, 4];
 
 /// Directory holding the CSVs for one scenario/protocol/variant triple:
 /// `results/<scenario>/<protocol>/<variant>/`.
@@ -122,16 +130,41 @@ fn run_index(scenario: &str, protocol: &str, variant: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Rotate a validator set by `k` positions within the committee.
-fn rotate(base: &[usize], k: usize) -> Vec<usize> {
-    base.iter().map(|v| (v + k) % COMMITTEE_SIZE).collect()
-}
-
 /// Healthy → degraded → healthy, all full-mesh.
 ///
-/// If BLIND_VALIDATORS IS USED: In the degraded phase each slow validator's links to `BLIND_VALIDATORS` are
-/// slow, so its leader block reaches only a partial quorum (5 of 10)
-fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfig {
+/// `slow_count` validators (a block starting in `SLOW_VALIDATORS`, rotated by
+/// `k`) are slow in the degraded phase. Like the crash set's `crash_count`, it
+/// is capped at each protocol's fault tolerance (`n - commit_quorum`): the DAG
+/// round clock advances on the committer's commit quorum, so a protocol whose
+/// quorum needs the slow validators' blocks — blue-bottle's 9 of 10 — would
+/// otherwise run every round at the slow links' pace for *any* leader count,
+/// which measures the fault-tolerance mismatch rather than the scheduler.
+///
+/// In the degraded phase every link touching a slow validator runs at
+/// 1.0–1.3 s in *both* directions (the slow validator is symmetrically slow),
+/// while the remaining validators keep their 50–100 ms links and form a
+/// quorum on their own. A slow validator therefore falls rounds behind and
+/// its leader block reaches nobody in time: the fast quorum blames it and the
+/// slot is cleanly skipped. What a skipped slot costs is the leader timeout
+/// the fast validators spend waiting for it before they propose — one
+/// `round_timeout` per round that has a slow leader. With three slow validators
+/// and one leader per round that is 3 rounds in 10; with five leaders it is 7
+/// in 10, so the round period (and commit latency) grows with the leader
+/// count, and the adaptive scheduler is expected to shed leaders until it
+/// matches `fixed_1`.
+///
+/// A *one-way* slowdown (`slow_blind`, i.e. only the slow validator's outgoing
+/// links to part of the committee) was tried first and rejected: the slow
+/// leader's block then arrives late at only part of the committee, and whether
+/// that leaves the slot undecided is a race against the round timeout that
+/// *more* leaders win more often (waiting on a leader nearly every round keeps
+/// the receivers in step with the slow validators), so extra leader slots
+/// were not a liability there.
+fn three_phase_config(
+    consensus: ConsensusProtocol,
+    k: usize,
+    slow_count: usize,
+) -> SimulationConfig {
     let healthy = |duration_secs| SimulationPhase {
         name: Some("healthy".to_string()),
         latency_min_ms: 50,
@@ -140,37 +173,17 @@ fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfi
         sample_interval_secs: 3,
         ..Default::default()
     };
-    let degraded_blinded = SimulationPhase {
+    let degraded = SimulationPhase {
         name: Some("high-latency".to_string()),
         latency_min_ms: 50,
         latency_max_ms: 100,
-        slow_validators: rotate(&SLOW_VALIDATORS, k),
+        slow_validators: (0..slow_count)
+            .map(|i| (SLOW_VALIDATORS[0] + i + k) % COMMITTEE_SIZE)
+            .collect(),
         slow_latency_min_ms: 1000,
         slow_latency_max_ms: 1300,
-        slow_blind: rotate(&BLIND_VALIDATORS, k),
         duration_secs: 400,
         sample_interval_secs: 5,
-        ..Default::default()
-    };
-
-    let degraded_targeted = SimulationPhase {
-        name: Some("high-latency".to_string()),
-        latency_min_ms: 50,
-        latency_max_ms: 100,
-        slow_validators: rotate(&SLOW_VALIDATORS, k),
-        slow_latency_min_ms: 5200,
-        slow_latency_max_ms: 7500,
-        duration_secs: 300,
-        sample_interval_secs: 10,
-        ..Default::default()
-    };
-
-    let degraded_uniform = SimulationPhase {
-        name: Some("high-latency".to_string()),
-        latency_min_ms: 50,
-        latency_max_ms: 1600,
-        duration_secs: 300,
-        sample_interval_secs: 10,
         ..Default::default()
     };
 
@@ -181,7 +194,7 @@ fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfi
             consensus,
             ..Default::default()
         },
-        phases: vec![healthy(100), degraded_blinded, healthy(100)],
+        phases: vec![healthy(100), degraded, healthy(100)],
         ..Default::default()
     }
 }
@@ -194,11 +207,16 @@ fn three_phase_config(consensus: ConsensusProtocol, k: usize) -> SimulationConfi
 /// a clean crash fault (and they rejoin when the final healthy phase restores
 /// the full mesh). `crash_count` is chosen per protocol so the live set is still
 /// a commit quorum and consensus keeps progressing: a crashed validator's leader
-/// slot is blamed by the live quorum and skipped. The more leaders per round,
-/// the more such dead slots stall the commit pipeline, so the adaptive scheduler
-/// should back off — behaving like `fixed_1` here while `fixed_5` pays for its
-/// dead leaders.
-fn crash_phase_config(consensus: ConsensusProtocol, k: usize, crash_count: usize) -> SimulationConfig {
+/// slot is blamed by the live quorum and skipped, after the live validators have
+/// waited out the leader timeout for it. The more leaders per round, the more
+/// rounds contain a dead leader to wait for, so the adaptive scheduler should
+/// back off — behaving like `fixed_1` here while `fixed_5` pays for its dead
+/// leaders.
+fn crash_phase_config(
+    consensus: ConsensusProtocol,
+    k: usize,
+    crash_count: usize,
+) -> SimulationConfig {
     let healthy = |duration_secs| SimulationPhase {
         name: Some("healthy".to_string()),
         latency_min_ms: 50,
@@ -254,12 +272,12 @@ fn next_csv_path(scenario: &str, protocol: &str, variant: &str) -> PathBuf {
 
 fn write_csv(path: &Path, samples: &[LatencySample]) {
     let mut file = fs::File::create(path).expect("failed to create latency CSV");
-    writeln!(file, "time_s,validator,p90_ms,avg_ms,phase").unwrap();
+    writeln!(file, "time_s,validator,p90_ms,avg_ms,phase,commits,leaders").unwrap();
     for s in samples {
         writeln!(
             file,
-            "{},{},{},{},{}",
-            s.time_s, s.validator, s.p90_ms, s.avg_ms, s.phase
+            "{},{},{},{},{},{},{}",
+            s.time_s, s.validator, s.p90_ms, s.avg_ms, s.phase, s.commits, s.leaders
         )
         .unwrap();
     }
@@ -296,9 +314,16 @@ fn run_scenario(
     );
 }
 
-/// Run the high-latency "degraded" three-phase scenario.
-fn run_variant(protocol: &str, variant: &str, consensus: ConsensusProtocol) {
-    run_scenario("degraded", protocol, variant, consensus, three_phase_config);
+/// Run the high-latency "degraded" three-phase scenario with `slow_count`
+/// validators on slow links (see `three_phase_config` for the per-protocol cap).
+fn run_variant(protocol: &str, variant: &str, consensus: ConsensusProtocol, slow_count: usize) {
+    run_scenario(
+        "degraded",
+        protocol,
+        variant,
+        consensus,
+        move |consensus, k| three_phase_config(consensus, k, slow_count),
+    );
 }
 
 /// Run the "crash" scenario with `crash_count` validators isolated mid-run.
@@ -308,27 +333,31 @@ fn run_crash_variant(
     consensus: ConsensusProtocol,
     crash_count: usize,
 ) {
-    run_scenario("crash", protocol, variant, consensus, move |consensus, k| {
-        crash_phase_config(consensus, k, crash_count)
-    });
+    run_scenario(
+        "crash",
+        protocol,
+        variant,
+        consensus,
+        move |consensus, k| crash_phase_config(consensus, k, crash_count),
+    );
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mysticeti_adaptive() {
-    run_variant("mysticeti", "adaptive", mysticeti(5, true));
+    run_variant("mysticeti", "adaptive", mysticeti(5, true), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mysticeti_fixed_1() {
-    run_variant("mysticeti", "fixed_1", mysticeti(1, false));
+    run_variant("mysticeti", "fixed_1", mysticeti(1, false), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mysticeti_fixed_5() {
-    run_variant("mysticeti", "fixed_5", mysticeti(5, false));
+    run_variant("mysticeti", "fixed_5", mysticeti(5, false), 3);
 }
 
 // --- Crash-fault scenario: validators go offline mid-run. ---
@@ -433,73 +462,73 @@ fn mahi_mahi_5_crash_fixed_5() {
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn blue_bottle_adaptive() {
-    run_variant("blue-bottle", "adaptive", blue_bottle(5, true));
+    run_variant("blue-bottle", "adaptive", blue_bottle(5, true), 1);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn blue_bottle_fixed_1() {
-    run_variant("blue-bottle", "fixed_1", blue_bottle(1, false));
+    run_variant("blue-bottle", "fixed_1", blue_bottle(1, false), 1);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn blue_bottle_fixed_5() {
-    run_variant("blue-bottle", "fixed_5", blue_bottle(5, false));
+    run_variant("blue-bottle", "fixed_5", blue_bottle(5, false), 1);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn nemo_nemo_adaptive() {
-    run_variant("nemo-nemo", "adaptive", nemo_nemo(5, true));
+    run_variant("nemo-nemo", "adaptive", nemo_nemo(5, true), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn nemo_nemo_fixed_1() {
-    run_variant("nemo-nemo", "fixed_1", nemo_nemo(1, false));
+    run_variant("nemo-nemo", "fixed_1", nemo_nemo(1, false), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn nemo_nemo_fixed_5() {
-    run_variant("nemo-nemo", "fixed_5", nemo_nemo(5, false));
+    run_variant("nemo-nemo", "fixed_5", nemo_nemo(5, false), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_4_adaptive() {
-    run_variant("mahi-mahi-4", "adaptive", mahi_mahi(5, 4, true));
+    run_variant("mahi-mahi-4", "adaptive", mahi_mahi(5, 4, true), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_4_fixed_1() {
-    run_variant("mahi-mahi-4", "fixed_1", mahi_mahi(1, 4, false));
+    run_variant("mahi-mahi-4", "fixed_1", mahi_mahi(1, 4, false), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_4_fixed_5() {
-    run_variant("mahi-mahi-4", "fixed_5", mahi_mahi(5, 4, false));
+    run_variant("mahi-mahi-4", "fixed_5", mahi_mahi(5, 4, false), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_5_adaptive() {
-    run_variant("mahi-mahi-5", "adaptive", mahi_mahi(5, 5, true));
+    run_variant("mahi-mahi-5", "adaptive", mahi_mahi(5, 5, true), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_5_fixed_1() {
-    run_variant("mahi-mahi-5", "fixed_1", mahi_mahi(1, 5, false));
+    run_variant("mahi-mahi-5", "fixed_1", mahi_mahi(1, 5, false), 3);
 }
 
 #[test]
 #[ignore = "long-running experiment; run via scripts/run_protocol.sh degraded"]
 fn mahi_mahi_5_fixed_5() {
-    run_variant("mahi-mahi-5", "fixed_5", mahi_mahi(5, 5, false));
+    run_variant("mahi-mahi-5", "fixed_5", mahi_mahi(5, 5, false), 3);
 }
 
 #[test]
@@ -509,6 +538,7 @@ fn cordial_miners_ps() {
         "cordial-miners-ps",
         "default",
         ConsensusProtocol::CordialMinersPartiallySynchronous,
+        3,
     );
 }
 
@@ -519,5 +549,6 @@ fn cordial_miners_async() {
         "cordial-miners-async",
         "default",
         ConsensusProtocol::CordialMinersAsynchronous,
+        3,
     );
 }

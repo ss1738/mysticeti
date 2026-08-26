@@ -33,6 +33,14 @@ pub struct RealBlockHandler<C: Ctx> {
 // todo - This value should be in bytes because it is capped by the wal entry size.
 pub const SOFT_MAX_PROPOSED_PER_BLOCK: usize = 20 * 1000;
 
+/// How long a proposed transaction's timestamp is retained while it waits to
+/// be committed. Timestamps are consumed on commit, so this only bounds the
+/// entries of blocks that never commit — but it also caps the latency that
+/// `transaction_committed_latency` can report: a block committed later than
+/// this is simply not observed. Keep it well above any latency worth measuring
+/// (degraded-network experiments routinely see tens of seconds).
+pub const TRANSACTION_TIME_RETENTION: Duration = Duration::from_secs(600);
+
 impl<C: Ctx> RealBlockHandler<C> {
     pub fn new(metrics: Arc<Metrics>) -> (Self, mpsc::Sender<Vec<Transaction>>) {
         let (sender, receiver) = mpsc::channel(1024);
@@ -80,7 +88,7 @@ impl<C: Ctx> RealBlockHandler<C> {
     pub fn cleanup(&self) {
         let _timer = self.metrics.block_handler_cleanup_utilization_timer();
         let mut l = self.transaction_time.lock();
-        l.retain(|_k, v| C::elapsed(v) < Duration::from_secs(10));
+        l.retain(|_k, v| C::elapsed(v) < TRANSACTION_TIME_RETENTION);
     }
 }
 
@@ -149,16 +157,16 @@ impl<C: Ctx> CommitHandler<C> {
         let committed = self
             .commit_interpreter
             .handle_commit(block_reader, committed_leaders);
-        let transaction_time = self.transaction_time.lock();
+        let mut transaction_time = self.transaction_time.lock();
         for commit in &committed {
             self.committed_leaders.push(commit.anchor);
             for block in &commit.blocks {
                 for (locator, transaction) in block.located_transactions() {
-                    self.update_metrics(
-                        transaction_time.get(&locator),
-                        current_timestamp,
-                        transaction,
-                    );
+                    // Only this replica's own proposals have a timestamp; a
+                    // committed transaction never needs it again, so consume it
+                    // rather than leave it for the periodic cleanup.
+                    let proposed_at = transaction_time.remove(&locator);
+                    self.update_metrics(proposed_at.as_ref(), current_timestamp, transaction);
                 }
             }
         }

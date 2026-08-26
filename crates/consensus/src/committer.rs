@@ -208,7 +208,12 @@ impl Committer {
                 .iter()
                 .position(|x| x.round() == round && x.authority() == authority)
                 .map_or_else(
-                    || self.leaders.iter().take_while(|x| x.round() <= round).count(),
+                    || {
+                        self.leaders
+                            .iter()
+                            .take_while(|x| x.round() <= round)
+                            .count()
+                    },
                     |pos| pos + 1,
                 ),
         };
@@ -402,6 +407,10 @@ impl DagConsensus for Committer {
         last_decided: Option<(RoundNumber, Authority)>,
     ) -> impl Iterator<Item = LeaderStatus> {
         self.try_commit(last_decided)
+    }
+
+    fn leaders_per_round(&self) -> usize {
+        self.number_of_leaders
     }
 
     fn get_leaders(&self, round: RoundNumber) -> Option<impl Iterator<Item = Authority>> {
